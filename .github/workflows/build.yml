@@ -19,8 +19,6 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
-
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
@@ -476,4 +474,5 @@ jobs:
                   if (Build.VERSION.SDK_INT >= 26) {
                       NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
                       nm.createNotificationChannel(new NotificationChannel(CHANNEL, "Espelhamento", NotificationManager.IMPORTANCE_LOW));
-                      b = new N
+                      b = new Notification.Builder(this, CHANNEL);
+            
