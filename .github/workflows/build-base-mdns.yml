@@ -1,0 +1,1835 @@
+name: Build TV Mirror APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Criar arquivos do projeto
+        run: |
+          set -e
+          mkdir -p tvmirror/app/src/main/java/com/tvmirror/app tvmirror/app/src/main/assets
+          cd tvmirror
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'TVMirror'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=false
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.tvmirror.app'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.tvmirror.app'
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 5
+                  versionName '5.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+          <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+              <application
+                  android:label="TV Mirror"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+                  android:allowBackup="false">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".MirrorService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/assets/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html lang="pt-BR">
+          <head>
+          <meta charset="utf-8">
+          <title>TV Mirror</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <style>
+            html, body { margin: 0; width: 100%; height: 100%; background: #000; overflow: hidden; cursor: none; font-family: sans-serif; }
+            #c { position: fixed; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+            .pill { position: fixed; padding: 10px 22px; border-radius: 999px; background: rgba(20,22,28,0.85); color: #fff; font-size: 22px; }
+            #msg { top: 24px; left: 24px; }
+            #snd { bottom: 24px; left: 24px; color: #ffd166; }
+            #st { top: 24px; right: 24px; display: none; font-size: 20px; color: #9fe870; }
+          </style>
+          </head>
+          <body>
+          <canvas id="c" width="16" height="9"></canvas>
+          <div id="msg" class="pill">Conectando...</div>
+          <div id="snd" class="pill" style="display:none">Som: aperte qualquer tecla no controle para ativar</div>
+          <div id="st" class="pill"></div>
+          <script>
+            var cv = document.getElementById('c');
+            var g = cv.getContext('2d');
+            var msg = document.getElementById('msg');
+            var snd = document.getElementById('snd');
+            var st = document.getElementById('st');
+
+            var lastSeq = -1, pendingBlob = null, decoding = false;
+            var shown = 0, bytes = 0, decMs = 0, statsOn = false;
+
+            // ---------- video: a TV pede cada quadro quando esta pronta ----------
+            function loop() {
+              fetch('/frame?after=' + lastSeq, { cache: 'no-store' }).then(function (res) {
+                var s = parseInt(res.headers.get('X-Seq'), 10);
+                if (res.status === 204) {
+                  if (!isNaN(s) && s < lastSeq) lastSeq = -1;
+                  loop();
+                  return;
+                }
+                return res.blob().then(function (b) {
+                  lastSeq = isNaN(s) ? lastSeq + 1 : s;
+                  loop();
+                  bytes += b.size;
+                  pendingBlob = b;
+                  kick();
+                });
+              }).catch(function () {
+                msg.style.display = 'block';
+                msg.textContent = 'Reconectando...';
+                setTimeout(loop, 1000);
+              });
+            }
+
+            function finish(t0, ok) {
+              decoding = false;
+              if (ok) {
+                shown++;
+                decMs = performance.now() - t0;
+                msg.style.display = 'none';
+              }
+              kick();
+            }
+
+            function kick() {
+              if (decoding || !pendingBlob) return;
+              var b = pendingBlob;
+              pendingBlob = null;
+              decoding = true;
+              var t0 = performance.now();
+              if (window.createImageBitmap) {
+                createImageBitmap(b).then(function (bm) {
+                  if (cv.width !== bm.width || cv.height !== bm.height) { cv.width = bm.width; cv.height = bm.height; }
+                  g.drawImage(bm, 0, 0);
+                  if (bm.close) bm.close();
+                  finish(t0, true);
+                }).catch(function () { finish(t0, false); });
+              } else {
+                var img = new Image();
+                var u = URL.createObjectURL(b);
+                img.onload = function () {
+                  if (cv.width !== img.width || cv.height !== img.height) { cv.width = img.width; cv.height = img.height; }
+                  g.drawImage(img, 0, 0);
+                  URL.revokeObjectURL(u);
+                  finish(t0, true);
+                };
+                img.onerror = function () { URL.revokeObjectURL(u); finish(t0, false); };
+                img.src = u;
+              }
+            }
+
+            setInterval(function () {
+              if (statsOn) {
+                st.textContent = shown + ' fps | ' + Math.round(bytes / 1024) + ' KB/s | decod. ' + Math.round(decMs) + ' ms';
+              }
+              shown = 0;
+              bytes = 0;
+            }, 1000);
+
+            loop();
+
+            // ---------- audio ----------
+            var cfg = { audio: false, rate: 48000, ch: 2, v: 0 };
+            var ctx = null, audioCtl = null, audioVer = -1;
+            var nextTime = 0, delay = 0.12, leftover = null, fsDone = false;
+
+            function updateHint() {
+              var need = cfg.audio && (!ctx || ctx.state !== 'running');
+              snd.textContent = 'Som: aperte qualquer tecla no controle para ativar';
+              snd.style.display = need ? 'block' : 'none';
+            }
+
+            function flash(text) {
+              snd.style.display = 'block';
+              snd.textContent = text;
+              setTimeout(updateHint, 1800);
+            }
+
+            function ensureCtx() {
+              if (ctx) return true;
+              var AC = window.AudioContext || window.webkitAudioContext;
+              if (!AC) return false;
+              try { ctx = new AC(); } catch (err) { return false; }
+              ctx.onstatechange = updateHint;
+              return true;
+            }
+
+            function stopAudioStream() {
+              if (audioCtl) {
+                try { audioCtl.abort(); } catch (err) {}
+                audioCtl = null;
+              }
+            }
+
+            function startAudioStream() {
+              stopAudioStream();
+              var ctl = window.AbortController ? new AbortController() : { abort: function () {} };
+              audioCtl = ctl;
+              audioVer = cfg.v;
+              leftover = null;
+              nextTime = 0;
+              function lost() {
+                if (audioCtl === ctl) { audioCtl = null; setTimeout(syncAudio, 1000); }
+              }
+              fetch('/audio', ctl.signal ? { signal: ctl.signal } : undefined).then(function (res) {
+                var reader = res.body.getReader();
+                function read() {
+                  reader.read().then(function (r) {
+                    if (audioCtl !== ctl) return;
+                    if (r.done) { lost(); return; }
+                    playChunk(r.value);
+                    read();
+                  }).catch(lost);
+                }
+                read();
+              }).catch(lost);
+            }
+
+            function syncAudio() {
+              if (!cfg.audio) { stopAudioStream(); updateHint(); return; }
+              if (!ensureCtx()) return;
+              if (ctx.state === 'suspended' && ctx.resume) {
+                var p = ctx.resume();
+                if (p && p.then) p.then(updateHint, function () {});
+              }
+              if (!audioCtl || audioVer !== cfg.v) startAudioStream();
+              updateHint();
+            }
+
+            function pollCfg() {
+              fetch('/config', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (c) {
+                var changed = (c.v !== cfg.v) || (c.audio !== cfg.audio);
+                cfg = c;
+                if (changed || (cfg.audio && !audioCtl)) syncAudio();
+              }).catch(function () {});
+            }
+            pollCfg();
+            setInterval(pollCfg, 2000);
+
+            function activate(e) {
+              if (!fsDone) {
+                fsDone = true;
+                try {
+                  var el = document.documentElement;
+                  if (el.requestFullscreen) el.requestFullscreen().catch(function () {});
+                } catch (err) {}
+              }
+              if (e && e.type === 'keydown' && e.keyCode === 49) {
+                statsOn = !statsOn;
+                st.style.display = statsOn ? 'block' : 'none';
+              }
+              if (cfg.audio) {
+                if (!ctx) syncAudio();
+                if (ctx && ctx.state === 'suspended' && ctx.resume) {
+                  var p = ctx.resume();
+                  if (p && p.then) p.then(updateHint, function () {});
+                }
+              }
+              if (e && e.type === 'keydown' && ctx) {
+                var c = e.keyCode, changed = false;
+                if (c === 39) { delay += 0.05; changed = true; }
+                if (c === 37) { delay = Math.max(0.02, delay - 0.05); changed = true; }
+                if (changed) {
+                  nextTime = 0;
+                  flash('Atraso do som: ' + Math.round(delay * 1000) + ' ms');
+                }
+              }
+            }
+            document.addEventListener('keydown', activate);
+            document.addEventListener('click', activate);
+
+            function playChunk(chunk) {
+              var chn = cfg.ch === 1 ? 1 : 2;
+              var bpf = 2 * chn;
+              var data = chunk;
+              if (leftover) {
+                var m = new Uint8Array(leftover.length + chunk.length);
+                m.set(leftover, 0);
+                m.set(chunk, leftover.length);
+                data = m;
+              }
+              var frames = Math.floor(data.length / bpf);
+              var used = frames * bpf;
+              leftover = used < data.length ? data.slice(used) : null;
+              if (frames === 0) return;
+              if (!ctx || ctx.state !== 'running') return;
+              var now = ctx.currentTime;
+              if (nextTime < now + 0.02) nextTime = now + delay;
+              else if (nextTime > now + delay + 0.4) return;
+              var buf = ctx.createBuffer(chn, frames, cfg.rate);
+              var L = buf.getChannelData(0);
+              var R = chn === 2 ? buf.getChannelData(1) : null;
+              var dv = new DataView(data.buffer, data.byteOffset, used);
+              for (var i = 0; i < frames; i++) {
+                L[i] = dv.getInt16(i * bpf, true) / 32768;
+                if (R) R[i] = dv.getInt16(i * bpf + 2, true) / 32768;
+              }
+              var src = ctx.createBufferSource();
+              src.buffer = buf;
+              src.connect(ctx.destination);
+              src.start(nextTime);
+              nextTime += buf.duration;
+            }
+          </script>
+          </body>
+          </html>
+          EOF
+
+          cat > app/src/main/java/com/tvmirror/app/MirrorServer.java <<'EOF'
+          package com.tvmirror.app;
+
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+          import java.io.OutputStream;
+          import java.net.InetSocketAddress;
+          import java.net.ServerSocket;
+          import java.net.Socket;
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.concurrent.LinkedBlockingQueue;
+          import java.util.concurrent.TimeUnit;
+
+          public class MirrorServer {
+              private static volatile long lastFrameReq = 0;
+
+              static boolean viewerActive() {
+                  return System.currentTimeMillis() - lastFrameReq < 3000;
+              }
+
+              private final int port;
+              private final byte[] html;
+              private volatile String config = "{\"audio\":false,\"rate\":48000,\"ch\":2,\"v\":0}";
+              private ServerSocket serverSocket;
+              private volatile boolean running = false;
+              private final Object lock = new Object();
+              private byte[] frame = null;
+              private long seq = 0;
+              private final List<Socket> clients = new ArrayList<Socket>();
+              private final List<LinkedBlockingQueue<byte[]>> audioQueues = new ArrayList<LinkedBlockingQueue<byte[]>>();
+
+              public MirrorServer(int port, byte[] html) {
+                  this.port = port;
+                  this.html = html;
+              }
+
+              public void setConfig(String c) {
+                  config = c;
+              }
+
+              public void start() throws Exception {
+                  serverSocket = new ServerSocket();
+                  serverSocket.setReuseAddress(true);
+                  serverSocket.bind(new InetSocketAddress(port));
+                  running = true;
+                  Thread t = new Thread(new Runnable() {
+                      @Override public void run() { acceptLoop(); }
+                  }, "mirror-accept");
+                  t.start();
+              }
+
+              private void acceptLoop() {
+                  while (running) {
+                      try {
+                          final Socket s = serverSocket.accept();
+                          synchronized (clients) { clients.add(s); }
+                          Thread t = new Thread(new Runnable() {
+                              @Override public void run() { handle(s); }
+                          }, "mirror-client");
+                          t.start();
+                      } catch (Exception e) {
+                          if (!running) return;
+                      }
+                  }
+              }
+
+              public void push(byte[] jpeg) {
+                  synchronized (lock) {
+                      frame = jpeg;
+                      seq++;
+                      lock.notifyAll();
+                  }
+              }
+
+              public void pushAudio(byte[] chunk) {
+                  synchronized (audioQueues) {
+                      for (LinkedBlockingQueue<byte[]> q : audioQueues) {
+                          while (!q.offer(chunk)) { q.poll(); }
+                      }
+                  }
+              }
+
+              private void handle(Socket s) {
+                  try {
+                      s.setTcpNoDelay(true);
+                      s.setSoTimeout(30000);
+                      BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream(), "ISO-8859-1"));
+                      OutputStream out = s.getOutputStream();
+                      while (running) {
+                          String line = in.readLine();
+                          if (line == null) return;
+                          String h;
+                          while ((h = in.readLine()) != null && h.length() > 0) { }
+                          String[] parts = line.split(" ");
+                          String path = parts.length > 1 ? parts[1] : "/";
+                          if (path.startsWith("/frame")) {
+                              serveFrame(out, path);
+                          } else if (path.startsWith("/audio")) {
+                              s.setSoTimeout(0);
+                              audio(s, out);
+                              return;
+                          } else if (path.startsWith("/config")) {
+                              byte[] b = config.getBytes("UTF-8");
+                              String head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n"
+                                      + "Content-Length: " + b.length + "\r\nConnection: keep-alive\r\n\r\n";
+                              out.write(head.getBytes("ISO-8859-1"));
+                              out.write(b);
+                              out.flush();
+                          } else if (path.equals("/") || path.startsWith("/?") || path.startsWith("/index")) {
+                              String head = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+                                      + "Cache-Control: no-cache\r\n"
+                                      + "Content-Length: " + html.length + "\r\nConnection: close\r\n\r\n";
+                              out.write(head.getBytes("ISO-8859-1"));
+                              out.write(html);
+                              out.flush();
+                              return;
+                          } else {
+                              out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".getBytes("ISO-8859-1"));
+                              out.flush();
+                              return;
+                          }
+                      }
+                  } catch (Exception e) {
+                      // cliente desconectou
+                  } finally {
+                      try { s.close(); } catch (Exception e) { }
+                      synchronized (clients) { clients.remove(s); }
+                  }
+              }
+
+              // A TV pede o quadro seguinte ao que ja tem; o servidor espera um quadro novo (ate 2 s).
+              private void serveFrame(OutputStream out, String path) throws Exception {
+                  lastFrameReq = System.currentTimeMillis();
+                  long after = -1;
+                  int q = path.indexOf("after=");
+                  if (q >= 0) {
+                      try { after = Long.parseLong(path.substring(q + 6).split("&")[0]); } catch (Exception e) { }
+                  }
+                  byte[] f;
+                  long s;
+                  synchronized (lock) {
+                      long deadline = System.currentTimeMillis() + 2000;
+                      while (running && (frame == null || seq <= after)) {
+                          long w = deadline - System.currentTimeMillis();
+                          if (w <= 0) break;
+                          lock.wait(w);
+                      }
+                      f = frame;
+                      s = seq;
+                  }
+                  lastFrameReq = System.currentTimeMillis();
+                  if (f == null || s <= after) {
+                      String head = "HTTP/1.1 204 No Content\r\nX-Seq: " + s + "\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n\r\n";
+                      out.write(head.getBytes("ISO-8859-1"));
+                      out.flush();
+                      return;
+                  }
+                  String head = "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: " + f.length
+                          + "\r\nX-Seq: " + s + "\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n\r\n";
+                  out.write(head.getBytes("ISO-8859-1"));
+                  out.write(f);
+                  out.flush();
+              }
+
+              private void audio(Socket s, OutputStream out) throws Exception {
+                  try { s.setSendBufferSize(16 * 1024); } catch (Exception e) { }
+                  LinkedBlockingQueue<byte[]> q = new LinkedBlockingQueue<byte[]>(25);
+                  synchronized (audioQueues) { audioQueues.add(q); }
+                  try {
+                      String head = "HTTP/1.1 200 OK\r\n"
+                              + "Cache-Control: no-cache, no-store\r\n"
+                              + "Connection: close\r\n"
+                              + "Content-Type: application/octet-stream\r\n\r\n";
+                      out.write(head.getBytes("ISO-8859-1"));
+                      out.flush();
+                      while (running) {
+                          byte[] c = q.poll(1, TimeUnit.SECONDS);
+                          if (c == null) continue;
+                          out.write(c);
+                          out.flush();
+                      }
+                  } finally {
+                      synchronized (audioQueues) { audioQueues.remove(q); }
+                  }
+              }
+
+              public void stop() {
+                  running = false;
+                  try { if (serverSocket != null) serverSocket.close(); } catch (Exception e) { }
+                  synchronized (clients) {
+                      for (Socket s : clients) {
+                          try { s.close(); } catch (Exception e) { }
+                      }
+                      clients.clear();
+                  }
+                  synchronized (lock) { lock.notifyAll(); }
+                  lastFrameReq = 0;
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/tvmirror/app/AudioCapture.java <<'EOF'
+          package com.tvmirror.app;
+
+          import android.annotation.TargetApi;
+          import android.media.AudioAttributes;
+          import android.media.AudioFormat;
+          import android.media.AudioPlaybackCaptureConfiguration;
+          import android.media.AudioRecord;
+          import android.media.projection.MediaProjection;
+
+          @TargetApi(29)
+          public class AudioCapture {
+              private final MirrorServer server;
+              private final int rate;
+              private final int channels;
+              private final int chunk;
+              private AudioRecord record;
+              private Thread thread;
+              private volatile boolean running = false;
+
+              public AudioCapture(MirrorServer server, int rate, int channels) {
+                  this.server = server;
+                  this.rate = rate;
+                  this.channels = channels;
+                  this.chunk = (rate / 50) * channels * 2; // 20 ms de audio 16 bits
+              }
+
+              public void start(MediaProjection projection) throws Exception {
+                  try {
+                      AudioPlaybackCaptureConfiguration cfg = new AudioPlaybackCaptureConfiguration.Builder(projection)
+                              .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                              .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                              .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                              .build();
+                      AudioFormat fmt = new AudioFormat.Builder()
+                              .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                              .setSampleRate(rate)
+                              .setChannelMask(channels == 1 ? AudioFormat.CHANNEL_IN_MONO : AudioFormat.CHANNEL_IN_STEREO)
+                              .build();
+                      record = new AudioRecord.Builder()
+                              .setAudioFormat(fmt)
+                              .setBufferSizeInBytes(chunk * 8)
+                              .setAudioPlaybackCaptureConfig(cfg)
+                              .build();
+                      if (record.getState() != AudioRecord.STATE_INITIALIZED) {
+                          throw new IllegalStateException("AudioRecord nao iniciou");
+                      }
+                      record.startRecording();
+                      running = true;
+                      thread = new Thread(new Runnable() {
+                          @Override public void run() { loop(); }
+                      }, "audio-capture");
+                      thread.start();
+                  } catch (Exception e) {
+                      stop();
+                      throw e;
+                  }
+              }
+
+              private void loop() {
+                  byte[] buf = new byte[chunk];
+                  while (running) {
+                      int n;
+                      try {
+                          n = record.read(buf, 0, chunk);
+                      } catch (Exception e) {
+                          break;
+                      }
+                      if (n < 0) break;
+                      if (n == 0) continue;
+                      byte[] out = new byte[n];
+                      System.arraycopy(buf, 0, out, 0, n);
+                      server.pushAudio(out);
+                  }
+              }
+
+              public void stop() {
+                  running = false;
+                  try { if (record != null) record.stop(); } catch (Exception e) { }
+                  try { if (thread != null) thread.join(500); } catch (Exception e) { }
+                  try { if (record != null) record.release(); } catch (Exception e) { }
+                  record = null;
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/tvmirror/app/MdnsResponder.java <<'EOF'
+          package com.tvmirror.app;
+
+          import android.content.Context;
+          import android.net.wifi.WifiManager;
+          import android.os.Build;
+          import java.io.ByteArrayOutputStream;
+          import java.net.*;
+          import java.util.*;
+
+          // Responde consultas mDNS A para tvmirror-<modelo>.local.
+          public class MdnsResponder {
+              private static final String GROUP = "224.0.0.251";
+              private static final int MDNS_PORT = 5353;
+              private final Context context;
+              private final String host;
+              private volatile boolean running;
+              private MulticastSocket socket;
+              private Thread worker;
+              private WifiManager.MulticastLock multicastLock;
+
+              public MdnsResponder(Context c) {
+                  context = c.getApplicationContext();
+                  host = getHostName();
+              }
+
+              public static String getHostName() {
+                  String model = Build.MODEL == null ? "android" : Build.MODEL;
+                  String slug = model.toLowerCase(Locale.US).replaceAll("[^a-z0-9]+", "");
+                  if (slug.length() == 0) slug = "android";
+                  if (slug.length() > 24) slug = slug.substring(0, 24);
+                  return "tvmirror-" + slug + ".local";
+              }
+
+              public void start() {
+                  if (running) return;
+                  try {
+                      WifiManager wm = (WifiManager) context.getSystemService(Context.WIFI_SERVICE);
+                      if (wm != null) {
+                          multicastLock = wm.createMulticastLock("tvmirror-mdns");
+                          multicastLock.setReferenceCounted(false);
+                          multicastLock.acquire();
+                      }
+                      socket = new MulticastSocket(null);
+                      socket.setReuseAddress(true);
+                      socket.bind(new InetSocketAddress(MDNS_PORT));
+                      socket.setTimeToLive(255);
+                      socket.joinGroup(InetAddress.getByName(GROUP));
+                      running = true;
+                      worker = new Thread(new Runnable() {
+                          @Override public void run() { listen(); }
+                      }, "tvmirror-mdns");
+                      worker.start();
+                  } catch (Exception e) { stop(); }
+              }
+
+              private void listen() {
+                  byte[] buffer = new byte[1500];
+                  while (running) {
+                      try {
+                          DatagramPacket p = new DatagramPacket(buffer, buffer.length);
+                          socket.receive(p);
+                          byte[] response = answer(p.getData(), p.getLength());
+                          if (response != null) {
+                              socket.send(new DatagramPacket(response, response.length, p.getAddress(), p.getPort()));
+                          }
+                      } catch (Exception e) {
+                          if (running) try { Thread.sleep(150); } catch (Exception ignored) { }
+                      }
+                  }
+              }
+
+              private byte[] answer(byte[] q, int len) throws Exception {
+                  if (len < 17) return null;
+                  int count = u16(q, 4), pos = 12, end = -1;
+                  boolean match = false;
+                  for (int i = 0; i < count; i++) {
+                      StringBuilder name = new StringBuilder();
+                      while (pos < len) {
+                          int n = q[pos++] & 255;
+                          if (n == 0) break;
+                          if ((n & 0xC0) != 0 || n > 63 || pos + n > len) return null;
+                          if (name.length() > 0) name.append('.');
+                          name.append(new String(q, pos, n, "US-ASCII"));
+                          pos += n;
+                      }
+                      if (pos + 4 > len) return null;
+                      int type = u16(q, pos), cls = u16(q, pos + 2);
+                      pos += 4;
+                      if (name.toString().equalsIgnoreCase(host) && type == 1
+                              && (cls == 1 || cls == 0x8001)) match = true;
+                      end = pos;
+                  }
+                  if (!match || end < 0) return null;
+                  List<byte[]> ips = getIps();
+                  if (ips.isEmpty()) return null;
+                  ByteArrayOutputStream out = new ByteArrayOutputStream();
+                  out.write(q, 0, 2);
+                  put16(out, 0x8400);
+                  put16(out, count);
+                  put16(out, ips.size());
+                  put16(out, 0); put16(out, 0);
+                  out.write(q, 12, end - 12);
+                  for (byte[] ip : ips) {
+                      out.write(0xC0); out.write(0x0C);
+                      put16(out, 1); put16(out, 0x8001);
+                      out.write(new byte[] {0, 0, 0, 120});
+                      put16(out, 4); out.write(ip);
+                  }
+                  return out.toByteArray();
+              }
+
+              private static List<byte[]> getIps() {
+                  List<byte[]> ips = new ArrayList<byte[]>();
+                  try {
+                      for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                          if (!ni.isUp() || ni.isLoopback()) continue;
+                          for (InetAddress a : Collections.list(ni.getInetAddresses())) {
+                              if (a instanceof Inet4Address && !a.isLoopbackAddress() && !a.isLinkLocalAddress()) {
+                                  byte[] b = a.getAddress();
+                                  boolean found = false;
+                                  for (byte[] old : ips) if (Arrays.equals(old, b)) found = true;
+                                  if (!found) ips.add(b);
+                              }
+                          }
+                      }
+                  } catch (Exception ignored) { }
+                  return ips;
+              }
+
+              private static int u16(byte[] b, int p) {
+                  return ((b[p] & 255) << 8) | (b[p + 1] & 255);
+              }
+
+              private static void put16(ByteArrayOutputStream out, int n) {
+                  out.write((n >>> 8) & 255); out.write(n & 255);
+              }
+
+              public void stop() {
+                  running = false;
+                  try { if (socket != null) socket.close(); } catch (Exception ignored) { }
+                  socket = null;
+                  if (worker != null) worker.interrupt();
+                  worker = null;
+                  try { if (multicastLock != null && multicastLock.isHeld()) multicastLock.release(); }
+                  catch (Exception ignored) { }
+                  multicastLock = null;
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/tvmirror/app/TvLauncher.java <<'EOF'
+          package com.tvmirror.app;
+
+          import android.content.SharedPreferences;
+          import android.util.Base64;
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.net.InetSocketAddress;
+          import java.net.Socket;
+          import java.net.SocketTimeoutException;
+          import java.security.SecureRandom;
+          import java.security.cert.X509Certificate;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.List;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.concurrent.TimeUnit;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+          import javax.net.ssl.SSLContext;
+          import javax.net.ssl.SSLSocket;
+          import javax.net.ssl.TrustManager;
+          import javax.net.ssl.X509TrustManager;
+
+          // Procura uma TV Samsung na rede do hotspot e pede para ela abrir o navegador no endereco do app.
+          public class TvLauncher {
+              private static final SecureRandom RND = new SecureRandom();
+
+              public static String openUrl(List<String> myIps, int port, SharedPreferences prefs) {
+                  String tv = null;
+                  String myIp = null;
+                  for (String ip : myIps) {
+                      String found = scan(ip);
+                      if (found != null) { tv = found; myIp = ip; break; }
+                  }
+                  if (tv == null) {
+                      return "Não achei a TV na rede. Ela está conectada ao hotspot e ligada?";
+                  }
+                  String url = "http://" + MdnsResponder.getHostName() + ":" + port;
+                  String r = tryLaunch(tv, true, url, prefs);
+                  if (r == null) r = tryLaunch(tv, false, url, prefs);
+                  if (r == null) {
+                      return "Achei a TV (" + tv + "), mas ela não aceitou o comando. Digite no navegador dela: " + url;
+                  }
+                  return r;
+              }
+
+              private static String scan(final String myIp) {
+                  String[] o = myIp.split("\\.");
+                  if (o.length != 4) return null;
+                  final String prefix = o[0] + "." + o[1] + "." + o[2] + ".";
+                  ExecutorService ex = Executors.newFixedThreadPool(64);
+                  final List<String> hits = Collections.synchronizedList(new ArrayList<String>());
+                  for (int i = 1; i < 255; i++) {
+                      final String host = prefix + i;
+                      if (host.equals(myIp)) continue;
+                      ex.submit(new Runnable() {
+                          @Override public void run() {
+                              if (isOpen(host, 8002) || isOpen(host, 8001)) hits.add(host);
+                          }
+                      });
+                  }
+                  ex.shutdown();
+                  try { ex.awaitTermination(8, TimeUnit.SECONDS); } catch (InterruptedException e) { }
+                  ex.shutdownNow();
+                  return hits.isEmpty() ? null : hits.get(0);
+              }
+
+              private static boolean isOpen(String host, int port) {
+                  Socket s = new Socket();
+                  try {
+                      s.connect(new InetSocketAddress(host, port), 400);
+                      return true;
+                  } catch (Exception e) {
+                      return false;
+                  } finally {
+                      try { s.close(); } catch (Exception e) { }
+                  }
+              }
+
+              // Retorna uma mensagem se conseguiu falar com a TV; null se nao conseguiu conectar.
+              private static String tryLaunch(String ip, boolean secure, String url, SharedPreferences prefs) {
+                  int p = secure ? 8002 : 8001;
+                  Socket raw = null;
+                  Socket sock = null;
+                  try {
+                      raw = new Socket();
+                      raw.connect(new InetSocketAddress(ip, p), 3000);
+                      if (secure) {
+                          SSLContext sc = SSLContext.getInstance("TLS");
+                          sc.init(null, new TrustManager[] { new X509TrustManager() {
+                              @Override public void checkClientTrusted(X509Certificate[] c, String a) { }
+                              @Override public void checkServerTrusted(X509Certificate[] c, String a) { }
+                              @Override public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+                          } }, RND);
+                          SSLSocket ss = (SSLSocket) sc.getSocketFactory().createSocket(raw, ip, p, true);
+                          ss.startHandshake();
+                          sock = ss;
+                      } else {
+                          sock = raw;
+                      }
+                      sock.setSoTimeout(3000);
+                      InputStream in = sock.getInputStream();
+                      OutputStream out = sock.getOutputStream();
+
+                      String token = prefs.getString("tvtoken_" + ip, "");
+                      String name = Base64.encodeToString("TVMirror".getBytes("UTF-8"), Base64.NO_WRAP);
+                      String path = "/api/v2/channels/samsung.remote.control?name=" + name
+                              + (token.length() > 0 ? "&token=" + token : "");
+                      byte[] kb = new byte[16];
+                      RND.nextBytes(kb);
+                      String key = Base64.encodeToString(kb, Base64.NO_WRAP);
+                      String req = "GET " + path + " HTTP/1.1\r\nHost: " + ip + ":" + p
+                              + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key
+                              + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
+                      out.write(req.getBytes("ISO-8859-1"));
+                      out.flush();
+
+                      String resp = readHeaders(in);
+                      if (resp == null || !resp.contains(" 101")) return null;
+
+                      long deadline = System.currentTimeMillis() + 30000;
+                      long closeAfter = 0;
+                      boolean sent = false;
+                      Pattern tokenPat = Pattern.compile("\"token\"\\s*:\\s*\"([^\"]+)\"");
+                      while (System.currentTimeMillis() < deadline) {
+                          if (sent && System.currentTimeMillis() > closeAfter) break;
+                          String m;
+                          try {
+                              sock.setSoTimeout(1000);
+                              m = readFrame(sock, in);
+                          } catch (SocketTimeoutException e) {
+                              continue;
+                          }
+                          if (m == null) break;
+                          if (m.length() == 0) continue;
+                          if (m.contains("ms.channel.connect")) {
+                              Matcher mt = tokenPat.matcher(m);
+                              if (mt.find()) prefs.edit().putString("tvtoken_" + ip, mt.group(1)).apply();
+                              if (!sent) {
+                                  String json = "{\"method\":\"ms.channel.emit\",\"params\":{\"event\":\"ed.apps.launch\","
+                                          + "\"to\":\"host\",\"data\":{\"appId\":\"org.tizen.browser\","
+                                          + "\"action_type\":\"NATIVE_LAUNCH\",\"metaTag\":\"" + url + "\"}}}";
+                                  sendText(out, json);
+                                  sent = true;
+                                  closeAfter = System.currentTimeMillis() + 2500;
+                              }
+                          } else if (m.contains("ms.channel.timeout") || m.contains("ms.channel.unauthorized")) {
+                              return "A TV não autorizou. Aceite o aviso na tela da TV (com o controle) e tente de novo.";
+                          }
+                      }
+                      if (sent) {
+                          return "Comando enviado! A TV deve abrir o navegador. Se abrir sem o endereço, digite: " + url;
+                      }
+                      return "A TV não respondeu. Veja se apareceu um aviso na tela dela, aceite com o controle e tente de novo.";
+                  } catch (Exception e) {
+                      return null;
+                  } finally {
+                      try { if (sock != null) sock.close(); } catch (Exception e) { }
+                      try { if (raw != null) raw.close(); } catch (Exception e) { }
+                  }
+              }
+
+              private static String readHeaders(InputStream in) throws Exception {
+                  StringBuilder sb = new StringBuilder();
+                  int state = 0;
+                  while (sb.length() < 8192) {
+                      int b = in.read();
+                      if (b < 0) return null;
+                      sb.append((char) b);
+                      if (b == '\r' && (state == 0 || state == 2)) state++;
+                      else if (b == '\n' && (state == 1 || state == 3)) state++;
+                      else state = 0;
+                      if (state == 4) return sb.toString();
+                  }
+                  return null;
+              }
+
+              // null = conexao fechada; "" = quadro que nao e texto; senao o texto.
+              private static String readFrame(Socket sock, InputStream in) throws Exception {
+                  int b0 = in.read();
+                  if (b0 < 0) return null;
+                  sock.setSoTimeout(5000);
+                  int opcode = b0 & 0x0F;
+                  int b1 = in.read();
+                  if (b1 < 0) return null;
+                  boolean masked = (b1 & 0x80) != 0;
+                  long len = b1 & 0x7F;
+                  if (len == 126) {
+                      len = (in.read() << 8) | in.read();
+                  } else if (len == 127) {
+                      len = 0;
+                      for (int i = 0; i < 8; i++) len = (len << 8) | in.read();
+                  }
+                  if (len > 1000000) return null;
+                  byte[] mask = new byte[4];
+                  if (masked) readFully(in, mask);
+                  byte[] payload = new byte[(int) len];
+                  readFully(in, payload);
+                  if (masked) {
+                      for (int i = 0; i < payload.length; i++) payload[i] = (byte) (payload[i] ^ mask[i % 4]);
+                  }
+                  if (opcode == 8) return null;
+                  if (opcode == 1) return new String(payload, "UTF-8");
+                  return "";
+              }
+
+              private static void readFully(InputStream in, byte[] buf) throws Exception {
+                  int off = 0;
+                  while (off < buf.length) {
+                      int n = in.read(buf, off, buf.length - off);
+                      if (n < 0) throw new java.io.IOException("fim");
+                      off += n;
+                  }
+              }
+
+              private static void sendText(OutputStream out, String text) throws Exception {
+                  byte[] p = text.getBytes("UTF-8");
+                  byte[] mask = new byte[4];
+                  RND.nextBytes(mask);
+                  ByteArrayOutputStream b = new ByteArrayOutputStream();
+                  b.write(0x81);
+                  if (p.length < 126) {
+                      b.write(0x80 | p.length);
+                  } else {
+                      b.write(0x80 | 126);
+                      b.write((p.length >> 8) & 0xFF);
+                      b.write(p.length & 0xFF);
+                  }
+                  b.write(mask, 0, 4);
+                  for (int i = 0; i < p.length; i++) b.write(p[i] ^ mask[i % 4]);
+                  out.write(b.toByteArray());
+                  out.flush();
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/tvmirror/app/MirrorService.java <<'EOF'
+          package com.tvmirror.app;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.PixelFormat;
+          import android.hardware.display.DisplayManager;
+          import android.hardware.display.VirtualDisplay;
+          import android.media.Image;
+          import android.media.ImageReader;
+          import android.media.projection.MediaProjection;
+          import android.media.projection.MediaProjectionManager;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.HandlerThread;
+          import android.os.IBinder;
+          import android.os.PowerManager;
+          import android.os.Process;
+          import android.os.SystemClock;
+          import android.util.DisplayMetrics;
+          import android.view.Display;
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+          import java.nio.ByteBuffer;
+
+          public class MirrorService extends Service {
+              static volatile boolean running = false;
+              static volatile boolean audioActive = false;
+              static final int PORT = 8080;
+              static final String ACTION_STOP = "com.tvmirror.app.STOP";
+              static final String ACTION_UPDATE = "com.tvmirror.app.UPDATE";
+
+              private static final String CHANNEL = "mirror";
+
+              private int maxEdge = 1280;
+              private int quality = 60;
+              private int minIntervalMs = 31;
+              private boolean wantAudio = true;
+              private int rate = 48000;
+              private int ch = 2;
+              private int cfgVersion = 0;
+              private final Object audioLock = new Object();
+
+              private MediaProjection projection;
+              private MediaProjection.Callback projCallback;
+              private VirtualDisplay vd;
+              private ImageReader reader;
+              private HandlerThread thread;
+              private Handler handler;
+              private MirrorServer server;
+              private MdnsResponder mdns;
+              private DisplayManager dm;
+              private DisplayManager.DisplayListener dispListener;
+              private AudioCapture audio;
+              private PowerManager.WakeLock wl;
+              private int capW, capH, dpi;
+              private Bitmap bmp;
+              private long lastFrameMs = 0;
+              private boolean framePending = false;
+              private final ByteArrayOutputStream baos = new ByteArrayOutputStream(256 * 1024);
+
+              private final Runnable pendingTask = new Runnable() {
+                  @Override public void run() {
+                      framePending = false;
+                      if (reader != null) processFrame(reader);
+                  }
+              };
+
+              @Override public IBinder onBind(Intent i) { return null; }
+
+              @Override public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  if (intent != null && ACTION_UPDATE.equals(intent.getAction())) {
+                      if (running && handler != null) applySettings(intent);
+                      else stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  Notification n = buildNotification();
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+                  } else {
+                      startForeground(1, n);
+                  }
+                  if (running) return START_NOT_STICKY;
+                  if (intent == null) { stopSelf(); return START_NOT_STICKY; }
+                  try {
+                      setup(intent);
+                      running = true;
+                  } catch (Exception e) {
+                      cleanup();
+                      stopSelf();
+                  }
+                  return START_NOT_STICKY;
+              }
+
+              private void setup(Intent intent) throws Exception {
+                  int code = intent.getIntExtra("code", 0);
+                  Intent data = (Intent) intent.getParcelableExtra("data");
+                  readSettings(intent);
+
+                  MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+
+                  thread = new HandlerThread("capture", Process.THREAD_PRIORITY_DISPLAY);
+                  thread.start();
+                  handler = new Handler(thread.getLooper());
+
+                  projection = mpm.getMediaProjection(code, data);
+                  projCallback = new MediaProjection.Callback() {
+                      @Override public void onStop() { stopSelf(); }
+                  };
+                  projection.registerCallback(projCallback, handler);
+
+                  server = new MirrorServer(PORT, readAsset("index.html"));
+
+                  dm = (DisplayManager) getSystemService(DISPLAY_SERVICE);
+                  int[] s = computeSize();
+                  capW = s[0]; capH = s[1]; dpi = s[2];
+
+                  reader = makeReader();
+                  vd = projection.createVirtualDisplay("tvmirror", capW, capH, dpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.getSurface(), null, handler);
+
+                  dispListener = new DisplayManager.DisplayListener() {
+                      @Override public void onDisplayAdded(int id) { }
+                      @Override public void onDisplayRemoved(int id) { }
+                      @Override public void onDisplayChanged(int id) {
+                          if (id == Display.DEFAULT_DISPLAY) onScreenChanged();
+                      }
+                  };
+                  dm.registerDisplayListener(dispListener, handler);
+
+                  startAudio();
+                  server.start();
+                  mdns = new MdnsResponder(this);
+                  mdns.start();
+
+                  PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                  wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "tvmirror:capture");
+                  wl.acquire();
+              }
+
+              private void readSettings(Intent intent) {
+                  maxEdge = Math.max(320, intent.getIntExtra("edge", 1280));
+                  quality = Math.max(10, Math.min(100, intent.getIntExtra("quality", 60)));
+                  int fps = Math.max(5, Math.min(120, intent.getIntExtra("fps", 30)));
+                  minIntervalMs = Math.max(4, 1000 / fps - 2);
+                  wantAudio = intent.getBooleanExtra("audio", true);
+                  rate = intent.getIntExtra("rate", 48000);
+                  ch = intent.getIntExtra("ch", 2) == 1 ? 1 : 2;
+              }
+
+              // Aplica novas configuracoes sem parar o espelhamento.
+              private void applySettings(final Intent intent) {
+                  handler.post(new Runnable() {
+                      @Override public void run() {
+                          if (!running) return;
+                          int oldEdge = maxEdge;
+                          boolean oldAudio = wantAudio;
+                          int oldRate = rate;
+                          int oldCh = ch;
+                          readSettings(intent);
+                          if (maxEdge != oldEdge) onScreenChanged();
+                          if (wantAudio != oldAudio || rate != oldRate || ch != oldCh) startAudio();
+                      }
+                  });
+              }
+
+              // (Re)inicia a captura de audio conforme as configuracoes e avisa a TV pelo /config.
+              private void startAudio() {
+                  synchronized (audioLock) {
+                      audioActive = false;
+                      try { if (audio != null) audio.stop(); } catch (Exception e) { }
+                      audio = null;
+                      if (wantAudio && Build.VERSION.SDK_INT >= 29 && projection != null
+                              && checkSelfPermission("android.permission.RECORD_AUDIO") == PackageManager.PERMISSION_GRANTED) {
+                          try {
+                              audio = new AudioCapture(server, rate, ch);
+                              audio.start(projection);
+                              audioActive = true;
+                          } catch (Exception e) {
+                              audio = null;
+                              audioActive = false;
+                          }
+                      }
+                      cfgVersion++;
+                      server.setConfig("{\"audio\":" + audioActive + ",\"rate\":" + rate + ",\"ch\":" + ch + ",\"v\":" + cfgVersion + "}");
+                  }
+              }
+
+              private byte[] readAsset(String name) throws Exception {
+                  InputStream is = getAssets().open(name);
+                  ByteArrayOutputStream b = new ByteArrayOutputStream();
+                  byte[] buf = new byte[4096];
+                  int n;
+                  while ((n = is.read(buf)) > 0) b.write(buf, 0, n);
+                  is.close();
+                  return b.toByteArray();
+              }
+
+              private int[] computeSize() {
+                  DisplayMetrics m = new DisplayMetrics();
+                  dm.getDisplay(Display.DEFAULT_DISPLAY).getRealMetrics(m);
+                  int longEdge = Math.max(m.widthPixels, m.heightPixels);
+                  float scale = longEdge > maxEdge ? (float) maxEdge / longEdge : 1f;
+                  int w = Math.max(2, ((int) (m.widthPixels * scale)) & ~1);
+                  int h = Math.max(2, ((int) (m.heightPixels * scale)) & ~1);
+                  return new int[] { w, h, m.densityDpi };
+              }
+
+              private ImageReader makeReader() {
+                  ImageReader r = ImageReader.newInstance(capW, capH, PixelFormat.RGBA_8888, 2);
+                  r.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
+                      @Override public void onImageAvailable(ImageReader rd) { onFrameAvailable(rd); }
+                  }, handler);
+                  return r;
+              }
+
+              private void onScreenChanged() {
+                  try {
+                      if (vd == null) return;
+                      int[] s = computeSize();
+                      if (s[0] == capW && s[1] == capH) return;
+                      capW = s[0]; capH = s[1]; dpi = s[2];
+                      ImageReader old = reader;
+                      reader = makeReader();
+                      vd.setSurface(reader.getSurface());
+                      vd.resize(capW, capH, dpi);
+                      old.close();
+                      bmp = null;
+                  } catch (Exception e) {
+                      // ignora
+                  }
+              }
+
+              private void onFrameAvailable(ImageReader rd) {
+                  if (rd != reader) return;
+                  long wait = minIntervalMs - (SystemClock.uptimeMillis() - lastFrameMs);
+                  if (wait > 0) {
+                      if (!framePending) {
+                          framePending = true;
+                          handler.postDelayed(pendingTask, wait);
+                      }
+                      return;
+                  }
+                  processFrame(rd);
+              }
+
+              private void processFrame(ImageReader rd) {
+                  lastFrameMs = SystemClock.uptimeMillis();
+                  Image img = null;
+                  try {
+                      img = rd.acquireLatestImage();
+                      if (img == null) return;
+                      Image.Plane p = img.getPlanes()[0];
+                      ByteBuffer buf = p.getBuffer();
+                      int pixelStride = p.getPixelStride();
+                      int rowStride = p.getRowStride();
+                      int fullW = rowStride / pixelStride;
+                      int w = img.getWidth();
+                      int h = img.getHeight();
+                      if (bmp == null || bmp.getWidth() != fullW || bmp.getHeight() != h) {
+                          bmp = Bitmap.createBitmap(fullW, h, Bitmap.Config.ARGB_8888);
+                      }
+                      bmp.copyPixelsFromBuffer(buf);
+                      Bitmap out = bmp;
+                      if (fullW != w) out = Bitmap.createBitmap(bmp, 0, 0, w, h);
+                      baos.reset();
+                      out.compress(Bitmap.CompressFormat.JPEG, quality, baos);
+                      if (out != bmp) out.recycle();
+                      if (server != null) server.push(baos.toByteArray());
+                  } catch (Exception e) {
+                      // ignora frame com erro
+                  } finally {
+                      if (img != null) img.close();
+                  }
+              }
+
+              private Notification buildNotification() {
+                  Intent open = new Intent(this, MainActivity.class);
+                  int piFlags = Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0;
+                  PendingIntent pi = PendingIntent.getActivity(this, 0, open, piFlags);
+                  Intent stop = new Intent(this, MirrorService.class);
+                  stop.setAction(ACTION_STOP);
+                  PendingIntent stopPi = PendingIntent.getService(this, 1, stop, piFlags);
+                  Notification.Builder b;
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                      nm.createNotificationChannel(new NotificationChannel(CHANNEL, "Espelhamento", NotificationManager.IMPORTANCE_LOW));
+                      b = new Notification.Builder(this, CHANNEL);
+                  } else {
+                      b = new Notification.Builder(this);
+                  }
+                  return b.setContentTitle("Espelhando a tela")
+                          .setContentText("Abra o endereco no navegador da TV")
+                          .setSmallIcon(android.R.drawable.ic_menu_share)
+                          .setContentIntent(pi)
+                          .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Parar", stopPi)
+                          .setOngoing(true)
+                          .build();
+              }
+
+              private void cleanup() {
+                  running = false;
+                  audioActive = false;
+                  try { if (handler != null) handler.removeCallbacks(pendingTask); } catch (Exception e) { }
+                  synchronized (audioLock) {
+                      try { if (audio != null) audio.stop(); } catch (Exception e) { }
+                      audio = null;
+                  }
+                  try { if (dm != null && dispListener != null) dm.unregisterDisplayListener(dispListener); } catch (Exception e) { }
+                  try { if (vd != null) vd.release(); } catch (Exception e) { }
+                  try { if (reader != null) reader.close(); } catch (Exception e) { }
+                  try {
+                      if (projection != null) {
+                          if (projCallback != null) projection.unregisterCallback(projCallback);
+                          projection.stop();
+                      }
+                  } catch (Exception e) { }
+                  try { if (server != null) server.stop(); } catch (Exception e) { }
+                  try { if (mdns != null) mdns.stop(); } catch (Exception e) { }
+                  try { if (wl != null && wl.isHeld()) wl.release(); } catch (Exception e) { }
+                  try { if (thread != null) thread.quitSafely(); } catch (Exception e) { }
+                  vd = null; reader = null; projection = null; server = null;
+                  wl = null; thread = null; dispListener = null; bmp = null; mdns = null;
+              }
+
+              @Override public void onDestroy() {
+                  cleanup();
+                  super.onDestroy();
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/tvmirror/app/MainActivity.java <<'EOF'
+          package com.tvmirror.app;
+
+          import android.app.Activity;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
+          import android.media.projection.MediaProjectionManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.HorizontalScrollView;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import java.net.Inet4Address;
+          import java.net.InetAddress;
+          import java.net.NetworkInterface;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.List;
+
+          public class MainActivity extends Activity {
+              private static final int REQ_CAPTURE = 1001;
+
+              private static final int BG = 0xFF0E1014;
+              private static final int CARD = 0xFF1A1D24;
+              private static final int CHIP = 0xFF262B35;
+              private static final int ACCENT = 0xFF4C8DFF;
+              private static final int DANGER = 0xFFE5484D;
+              private static final int GREEN = 0xFF30A46C;
+              private static final int AMBER = 0xFFF5A524;
+              private static final int GRAY = 0xFF6B7280;
+              private static final int TEXT = 0xFFFFFFFF;
+              private static final int MUTED = 0xFF9AA3B2;
+              private static final int LINK = 0xFF7FB2FF;
+
+              private static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
+              private static final int WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
+
+              // indices de configuracao: 0 resolucao, 1 fps, 2 qualidade, 3 audio, 4 taxa do audio, 5 canais
+              private static final String[] RES_N = { "360p", "480p", "540p", "720p", "900p", "1080p" };
+              private static final int[] RES_V = { 640, 854, 960, 1280, 1600, 1920 };
+              private static final String[] FPS_N = { "15", "20", "24", "30", "45", "60" };
+              private static final int[] FPS_V = { 15, 20, 24, 30, 45, 60 };
+              private static final String[] QUAL_N = { "Baixa", "Média", "Alta", "Máxima" };
+              private static final int[] QUAL_V = { 45, 60, 75, 90 };
+              private static final String[] AUD_N = { "Ligado", "Desligado" };
+              private static final String[] RATE_N = { "48000 Hz", "44100 Hz", "32000 Hz", "24000 Hz", "16000 Hz" };
+              private static final int[] RATE_V = { 48000, 44100, 32000, 24000, 16000 };
+              private static final String[] CH_N = { "Estéreo", "Mono" };
+              private static final String[] PRESET_N = { "Fluido", "Equilibrado", "Nítido" };
+              private static final int[][] PRESET_V = { { 1, 3, 1 }, { 3, 3, 1 }, { 5, 3, 2 } };
+              private static final String[] KEYS = { "res", "fps", "qual", "aud", "rate", "ch" };
+              private static final int[] DEFAULTS = { 3, 3, 1, 0, 0, 0 };
+
+              private SharedPreferences prefs;
+              private final int[] sel = new int[6];
+              private final TextView[][] chips = new TextView[6][];
+              private final TextView[] presetChips = new TextView[3];
+              private View dot;
+              private TextView statusText, urlText, hintText, tvBtn, tvStatus, lockNote, mainBtn, audioText;
+              private final Handler ui = new Handler(Looper.getMainLooper());
+              private final Runnable ticker = new Runnable() {
+                  @Override public void run() {
+                      refresh();
+                      ui.postDelayed(this, 1000);
+                  }
+              };
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              private GradientDrawable rounded(int color, int radiusDp) {
+                  GradientDrawable g = new GradientDrawable();
+                  g.setColor(color);
+                  g.setCornerRadius(dp(radiusDp));
+                  return g;
+              }
+
+              private LinearLayout.LayoutParams lp(int w, int h, int topDp) {
+                  LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(w, h);
+                  p.topMargin = dp(topDp);
+                  return p;
+              }
+
+              private TextView text(String s, int sp, int color, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(sp);
+                  t.setTextColor(color);
+                  if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
+                  return t;
+              }
+
+              @Override protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  getWindow().setStatusBarColor(BG);
+                  getWindow().setNavigationBarColor(BG);
+                  prefs = getSharedPreferences("tvmirror", MODE_PRIVATE);
+                  for (int k = 0; k < 6; k++) sel[k] = prefs.getInt(KEYS[k], DEFAULTS[k]);
+
+                  ScrollView sv = new ScrollView(this);
+                  sv.setBackgroundColor(BG);
+                  sv.setFillViewport(true);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(22), dp(36), dp(22), dp(32));
+
+                  root.addView(text("TV Mirror", 30, TEXT, true));
+                  root.addView(text("Espelhe a tela do celular na TV pelo hotspot", 15, MUTED, false), lp(MATCH, WRAP, 4));
+
+                  // cartao de status
+                  LinearLayout card = new LinearLayout(this);
+                  card.setOrientation(LinearLayout.VERTICAL);
+                  card.setBackground(rounded(CARD, 16));
+                  card.setPadding(dp(18), dp(18), dp(18), dp(18));
+
+                  LinearLayout statusRow = new LinearLayout(this);
+                  statusRow.setOrientation(LinearLayout.HORIZONTAL);
+                  statusRow.setGravity(Gravity.CENTER_VERTICAL);
+                  dot = new View(this);
+                  statusRow.addView(dot, new LinearLayout.LayoutParams(dp(12), dp(12)));
+                  statusText = text("", 18, TEXT, true);
+                  LinearLayout.LayoutParams stp = new LinearLayout.LayoutParams(WRAP, WRAP);
+                  stp.leftMargin = dp(10);
+                  statusRow.addView(statusText, stp);
+                  card.addView(statusRow);
+
+                  urlText = text("", 20, LINK, true);
+                  urlText.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+                  urlText.setTextIsSelectable(true);
+                  card.addView(urlText, lp(MATCH, WRAP, 14));
+
+                  hintText = text("", 15, MUTED, false);
+                  card.addView(hintText, lp(MATCH, WRAP, 10));
+
+                  tvBtn = text("Abrir na TV automaticamente", 15, TEXT, true);
+                  tvBtn.setGravity(Gravity.CENTER);
+                  tvBtn.setPadding(dp(8), dp(13), dp(8), dp(13));
+                  tvBtn.setBackground(rounded(CHIP, 12));
+                  tvBtn.setOnClickListener(new View.OnClickListener() {
+                      @Override public void onClick(View v) { sendToTv(); }
+                  });
+                  card.addView(tvBtn, lp(MATCH, WRAP, 14));
+
+                  tvStatus = text("", 13, AMBER, false);
+                  card.addView(tvStatus, lp(MATCH, WRAP, 8));
+                  root.addView(card, lp(MATCH, WRAP, 22));
+
+                  // botao principal
+                  mainBtn = text("", 18, TEXT, true);
+                  mainBtn.setGravity(Gravity.CENTER);
+                  mainBtn.setPadding(dp(8), dp(18), dp(8), dp(18));
+                  mainBtn.setOnClickListener(new View.OnClickListener() {
+                      @Override public void onClick(View v) { toggle(); }
+                  });
+                  root.addView(mainBtn, lp(MATCH, WRAP, 20));
+
+                  lockNote = text("Mudanças valem na hora, sem parar o espelhamento.", 13, MUTED, false);
+                  root.addView(lockNote, lp(MATCH, WRAP, 10));
+
+                  // perfis
+                  root.addView(text("Perfil", 13, MUTED, true), lp(MATCH, WRAP, 22));
+                  LinearLayout prow = new LinearLayout(this);
+                  prow.setOrientation(LinearLayout.HORIZONTAL);
+                  for (int i = 0; i < 3; i++) {
+                      final int idx = i;
+                      TextView c = text(PRESET_N[i], 15, MUTED, true);
+                      c.setGravity(Gravity.CENTER);
+                      c.setPadding(dp(6), dp(13), dp(6), dp(13));
+                      c.setOnClickListener(new View.OnClickListener() {
+                          @Override public void onClick(View v) {
+                              SharedPreferences.Editor ed = prefs.edit();
+                              for (int k = 0; k < 3; k++) {
+                                  sel[k] = PRESET_V[idx][k];
+                                  ed.putInt(KEYS[k], sel[k]);
+                              }
+                              ed.apply();
+                              refresh();
+                              pushLive();
+                          }
+                      });
+                      LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(0, WRAP, 1f);
+                      if (i > 0) cp.leftMargin = dp(8);
+                      prow.addView(c, cp);
+                      presetChips[i] = c;
+                  }
+                  root.addView(prow, lp(MATCH, WRAP, 6));
+
+                  addChoice(root, "Resolução", 0, RES_N);
+                  addChoice(root, "FPS (quadros por segundo)", 1, FPS_N);
+                  addChoice(root, "Qualidade da imagem", 2, QUAL_N);
+                  addChoice(root, "Áudio", 3, AUD_N);
+                  addChoice(root, "Taxa do áudio", 4, RATE_N);
+                  addChoice(root, "Canais do áudio", 5, CH_N);
+
+                  audioText = text("", 13, MUTED, false);
+                  root.addView(audioText, lp(MATCH, WRAP, 22));
+
+                  sv.addView(root);
+                  setContentView(sv);
+
+                  List<String> perms = new ArrayList<String>();
+                  if (Build.VERSION.SDK_INT >= 33
+                          && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+                      perms.add("android.permission.POST_NOTIFICATIONS");
+                  }
+                  if (Build.VERSION.SDK_INT >= 29
+                          && checkSelfPermission("android.permission.RECORD_AUDIO") != PackageManager.PERMISSION_GRANTED) {
+                      perms.add("android.permission.RECORD_AUDIO");
+                  }
+                  if (!perms.isEmpty()) requestPermissions(perms.toArray(new String[0]), 1);
+
+                  refresh();
+              }
+
+              private void addChoice(LinearLayout root, String label, final int key, String[] names) {
+                  root.addView(text(label, 13, MUTED, true), lp(MATCH, WRAP, 18));
+                  HorizontalScrollView hs = new HorizontalScrollView(this);
+                  hs.setHorizontalScrollBarEnabled(false);
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  chips[key] = new TextView[names.length];
+                  for (int i = 0; i < names.length; i++) {
+                      final int idx = i;
+                      TextView c = text(names[i], 14, MUTED, true);
+                      c.setGravity(Gravity.CENTER);
+                      c.setPadding(dp(14), dp(11), dp(14), dp(11));
+                      c.setOnClickListener(new View.OnClickListener() {
+                          @Override public void onClick(View v) {
+                              sel[key] = idx;
+                              prefs.edit().putInt(KEYS[key], idx).apply();
+                              refresh();
+                              pushLive();
+                          }
+                      });
+                      LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(WRAP, WRAP);
+                      if (i > 0) cp.leftMargin = dp(8);
+                      row.addView(c, cp);
+                      chips[key][i] = c;
+                  }
+                  hs.addView(row);
+                  root.addView(hs, lp(MATCH, WRAP, 6));
+              }
+
+              @Override protected void onResume() {
+                  super.onResume();
+                  ui.post(ticker);
+              }
+
+              @Override protected void onPause() {
+                  super.onPause();
+                  ui.removeCallbacks(ticker);
+              }
+
+              private void toggle() {
+                  if (MirrorService.running) {
+                      stopService(new Intent(this, MirrorService.class));
+                      ui.postDelayed(new Runnable() {
+                          @Override public void run() { refresh(); }
+                      }, 500);
+                  } else {
+                      MediaProjectionManager m = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+                      startActivityForResult(m.createScreenCaptureIntent(), REQ_CAPTURE);
+                  }
+              }
+
+              @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  if (requestCode == REQ_CAPTURE && resultCode == RESULT_OK && data != null) {
+                      Intent i = new Intent(this, MirrorService.class);
+                      i.putExtra("code", resultCode);
+                      i.putExtra("data", data);
+                      putSettings(i);
+                      if (Build.VERSION.SDK_INT >= 26) startForegroundService(i);
+                      else startService(i);
+                      ui.postDelayed(new Runnable() {
+                          @Override public void run() { refresh(); }
+                      }, 800);
+                  }
+              }
+
+              private void putSettings(Intent i) {
+                  i.putExtra("edge", RES_V[sel[0]]);
+                  i.putExtra("fps", FPS_V[sel[1]]);
+                  i.putExtra("quality", QUAL_V[sel[2]]);
+                  i.putExtra("audio", sel[3] == 0);
+                  i.putExtra("rate", RATE_V[sel[4]]);
+                  i.putExtra("ch", sel[5] == 1 ? 1 : 2);
+              }
+
+              // Envia as configuracoes novas ao servico em execucao (sem parar o espelhamento).
+              private void pushLive() {
+                  if (!MirrorService.running) return;
+                  Intent i = new Intent(this, MirrorService.class);
+                  i.setAction(MirrorService.ACTION_UPDATE);
+                  putSettings(i);
+                  startService(i);
+              }
+
+              private void sendToTv() {
+                  if (!MirrorService.running) return;
+                  tvStatus.setVisibility(View.VISIBLE);
+                  tvStatus.setText("Procurando a TV na rede… (na primeira vez, aceite o aviso na TV)");
+                  final List<String> ips = localIps();
+                  new Thread(new Runnable() {
+                      @Override public void run() {
+                          final String r = TvLauncher.openUrl(ips, MirrorService.PORT, prefs);
+                          runOnUiThread(new Runnable() {
+                              @Override public void run() { tvStatus.setText(r); }
+                          });
+                      }
+                  }).start();
+              }
+
+              private void refresh() {
+                  boolean on = MirrorService.running;
+
+                  int color;
+                  String status;
+                  if (!on) { color = GRAY; status = "Parado"; }
+                  else if (MirrorServer.viewerActive()) { color = GREEN; status = "TV conectada"; }
+                  else { color = AMBER; status = "Aguardando a TV…"; }
+                  dot.setBackground(rounded(color, 6));
+                  statusText.setText(status);
+
+                  if (on) {
+                      StringBuilder sb = new StringBuilder();
+                      sb.append("Principal: http://").append(MdnsResponder.getHostName())
+                              .append(":").append(MirrorService.PORT);
+                      for (String ip : localIps()) {
+                          sb.append("\nAlternativo: http://").append(ip).append(":").append(MirrorService.PORT);
+                      }
+                      if (localIps().isEmpty()) sb.append("\nVerifique o hotspot");
+                      urlText.setVisibility(View.VISIBLE);
+                      urlText.setText(sb.toString());
+                      hintText.setText("Tente primeiro o endereço tvmirror-...local. Se a TV não encontrar o nome, use um dos endereços IP alternativos. Na TV, aperte 1 no controle para ver fps e tempo de decodificação.");
+                      tvBtn.setVisibility(View.VISIBLE);
+                  } else {
+                      urlText.setVisibility(View.GONE);
+                      hintText.setText("1. Ligue o hotspot do celular\n2. Conecte a TV nele\n3. Toque em Iniciar\n4. Abra o endereço mostrado no navegador da TV\n\nDica: hotspot em 5 GHz reduz o atraso.");
+                      tvBtn.setVisibility(View.GONE);
+                      tvStatus.setVisibility(View.GONE);
+                      tvStatus.setText("");
+                  }
+
+                  lockNote.setVisibility(on ? View.VISIBLE : View.GONE);
+
+                  for (int i = 0; i < 3; i++) {
+                      boolean match = sel[0] == PRESET_V[i][0] && sel[1] == PRESET_V[i][1] && sel[2] == PRESET_V[i][2];
+                      presetChips[i].setBackground(rounded(match ? ACCENT : CHIP, 12));
+                      presetChips[i].setTextColor(match ? TEXT : MUTED);
+                  }
+                  for (int k = 0; k < 6; k++) {
+                      for (int i = 0; i < chips[k].length; i++) {
+                          boolean s = (i == sel[k]);
+                          chips[k][i].setBackground(rounded(s ? ACCENT : CHIP, 12));
+                          chips[k][i].setTextColor(s ? TEXT : MUTED);
+                      }
+                  }
+
+                  mainBtn.setText(on ? "Parar espelhamento" : "Iniciar espelhamento");
+                  mainBtn.setBackground(rounded(on ? DANGER : ACCENT, 14));
+
+                  String a;
+                  if (Build.VERSION.SDK_INT < 29) {
+                      a = "Som: indisponível neste Android (precisa do 10 ou superior). O vídeo funciona normalmente.";
+                  } else if (on) {
+                      a = MirrorService.audioActive
+                              ? "Som: ativo. Se a TV não tocar sozinha, aperte qualquer tecla no controle uma vez. Setas esquerda/direita ajustam o atraso do som."
+                              : "Som: desligado ou sem permissão (permita o microfone nas permissões do app).";
+                  } else {
+                      a = "Som: disponível neste celular (Android 10+).";
+                  }
+                  audioText.setText(a);
+              }
+
+              private static List<String> localIps() {
+                  List<String> r = new ArrayList<String>();
+                  try {
+                      for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                          if (!ni.isUp() || ni.isLoopback()) continue;
+                          String n = ni.getName();
+                          if (n.startsWith("rmnet") || n.startsWith("ccmni") || n.startsWith("dummy")
+                                  || n.startsWith("tun") || n.startsWith("v4-")) continue;
+                          for (InetAddress a : Collections.list(ni.getInetAddresses())) {
+                              if (a instanceof Inet4Address && !a.isLoopbackAddress()) {
+                                  r.add(a.getHostAddress());
+                              }
+                          }
+                      }
+                  } catch (Exception e) { }
+                  return r;
+              }
+          }
+          EOF
+
+          find . -type f | sort
+
+      - name: Compilar APK
+        working-directory: tvmirror
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Renomear APK
+        run: cp tvmirror/app/build/outputs/apk/debug/app-debug.apk TVMirror.apk
+
+      - name: Guardar APK (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: TVMirror-apk
+          path: TVMirror.apk
+          if-no-files-found: error
+
+      - name: Publicar APK em Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: TV Mirror APK #${{ github.run_number }}
+          files: TVMirror.apk
+          fail_on_unmatched_files: true
+
+      - name: Salvar APK no repositorio (pasta apk)
+        run: |
+          mkdir -p apk
+          cp TVMirror.apk apk/TVMirror.apk
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add apk/TVMirror.apk
+          git commit -m "APK #${{ github.run_number }}" || echo "sem mudancas"
+          git push
+
+      - name: Resumo com link do APK
+        run: |
+          echo "### APK pronto" >> "$GITHUB_STEP_SUMMARY"
+          echo "Baixe aqui: https://github.com/${{ github.repository }}/releases/tag/apk-${{ github.run_number }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Ou direto do repositorio: https://github.com/${{ github.repository }}/raw/HEAD/apk/TVMirror.apk" >> "$GITHUB_STEP_SUMMARY"
