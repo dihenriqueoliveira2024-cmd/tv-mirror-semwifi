@@ -72,8 +72,8 @@ jobs:
                   applicationId 'com.tvmirror.app'
                   minSdk 21
                   targetSdk 34
-                  versionCode 2
-                  versionName '2.0'
+                  versionCode 3
+                  versionName '3.0'
               }
 
               compileOptions {
@@ -126,31 +126,106 @@ jobs:
           <meta name="viewport" content="width=device-width, initial-scale=1">
           <style>
             html, body { margin: 0; width: 100%; height: 100%; background: #000; overflow: hidden; cursor: none; font-family: sans-serif; }
-            #v { position: fixed; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
-            .pill { position: fixed; left: 24px; padding: 10px 22px; border-radius: 999px; background: rgba(20,22,28,0.85); color: #fff; font-size: 22px; }
-            #msg { top: 24px; }
-            #snd { bottom: 24px; color: #ffd166; }
+            #c { position: fixed; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+            .pill { position: fixed; padding: 10px 22px; border-radius: 999px; background: rgba(20,22,28,0.85); color: #fff; font-size: 22px; }
+            #msg { top: 24px; left: 24px; }
+            #snd { bottom: 24px; left: 24px; color: #ffd166; }
+            #st { top: 24px; right: 24px; display: none; font-size: 20px; color: #9fe870; }
           </style>
           </head>
           <body>
-          <img id="v" alt="">
+          <canvas id="c" width="16" height="9"></canvas>
           <div id="msg" class="pill">Conectando...</div>
           <div id="snd" class="pill">Som: aperte OK no controle para ativar</div>
+          <div id="st" class="pill"></div>
           <script>
-            var v = document.getElementById('v');
+            var cv = document.getElementById('c');
+            var g = cv.getContext('2d');
             var msg = document.getElementById('msg');
             var snd = document.getElementById('snd');
+            var st = document.getElementById('st');
 
-            function startVideo() { v.src = '/stream?' + Date.now(); }
-            v.onerror = function () {
-              msg.style.display = 'block';
-              msg.textContent = 'Reconectando...';
-              setTimeout(startVideo, 1000);
-            };
-            setInterval(function () { if (v.naturalWidth > 0) msg.style.display = 'none'; }, 500);
-            startVideo();
+            var lastSeq = -1, pendingBlob = null, decoding = false;
+            var shown = 0, bytes = 0, decMs = 0, statsOn = false;
 
-            var ctx = null, nextTime = 0, delay = 0.15, started = false, leftover = null;
+            // ---------- video: a TV pede cada quadro quando esta pronta ----------
+            function loop() {
+              fetch('/frame?after=' + lastSeq, { cache: 'no-store' }).then(function (res) {
+                var s = parseInt(res.headers.get('X-Seq'), 10);
+                if (res.status === 204) {
+                  if (!isNaN(s) && s < lastSeq) lastSeq = -1;
+                  loop();
+                  return;
+                }
+                return res.blob().then(function (b) {
+                  lastSeq = isNaN(s) ? lastSeq + 1 : s;
+                  loop();
+                  bytes += b.size;
+                  pendingBlob = b;
+                  kick();
+                });
+              }).catch(function () {
+                msg.style.display = 'block';
+                msg.textContent = 'Reconectando...';
+                setTimeout(loop, 1000);
+              });
+            }
+
+            function finish(t0, ok) {
+              decoding = false;
+              if (ok) {
+                shown++;
+                decMs = performance.now() - t0;
+                msg.style.display = 'none';
+              }
+              kick();
+            }
+
+            function kick() {
+              if (decoding || !pendingBlob) return;
+              var b = pendingBlob;
+              pendingBlob = null;
+              decoding = true;
+              var t0 = performance.now();
+              if (window.createImageBitmap) {
+                createImageBitmap(b).then(function (bm) {
+                  if (cv.width !== bm.width || cv.height !== bm.height) { cv.width = bm.width; cv.height = bm.height; }
+                  g.drawImage(bm, 0, 0);
+                  if (bm.close) bm.close();
+                  finish(t0, true);
+                }).catch(function () { finish(t0, false); });
+              } else {
+                var img = new Image();
+                var u = URL.createObjectURL(b);
+                img.onload = function () {
+                  if (cv.width !== img.width || cv.height !== img.height) { cv.width = img.width; cv.height = img.height; }
+                  g.drawImage(img, 0, 0);
+                  URL.revokeObjectURL(u);
+                  finish(t0, true);
+                };
+                img.onerror = function () { URL.revokeObjectURL(u); finish(t0, false); };
+                img.src = u;
+              }
+            }
+
+            setInterval(function () {
+              if (statsOn) {
+                st.textContent = shown + ' fps | ' + Math.round(bytes / 1024) + ' KB/s | decod. ' + Math.round(decMs) + ' ms';
+              }
+              shown = 0;
+              bytes = 0;
+            }, 1000);
+
+            loop();
+
+            // ---------- audio ----------
+            var cfg = { audio: true, rate: 48000, ch: 2 };
+            fetch('/config', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (c) {
+              cfg = c;
+              if (!c.audio) snd.style.display = 'none';
+            }).catch(function () {});
+
+            var ctx = null, nextTime = 0, delay = 0.12, started = false, leftover = null, fsDone = false;
 
             function flash(text) {
               snd.style.display = 'block';
@@ -159,12 +234,20 @@ jobs:
             }
 
             function activate(e) {
-              if (!started) {
-                started = true;
+              if (!fsDone) {
+                fsDone = true;
                 try {
                   var el = document.documentElement;
                   if (el.requestFullscreen) el.requestFullscreen().catch(function () {});
                 } catch (err) {}
+              }
+              if (e && e.type === 'keydown' && e.keyCode === 49) {
+                statsOn = !statsOn;
+                st.style.display = statsOn ? 'block' : 'none';
+              }
+              if (!cfg.audio) return;
+              if (!started) {
+                started = true;
                 var AC = window.AudioContext || window.webkitAudioContext;
                 if (!AC) { snd.textContent = 'Este navegador nao suporta som'; return; }
                 ctx = new AC();
@@ -201,6 +284,8 @@ jobs:
             }
 
             function playChunk(chunk) {
+              var ch = cfg.ch === 1 ? 1 : 2;
+              var bpf = 2 * ch;
               var data = chunk;
               if (leftover) {
                 var m = new Uint8Array(leftover.length + chunk.length);
@@ -208,19 +293,20 @@ jobs:
                 m.set(chunk, leftover.length);
                 data = m;
               }
-              var frames = Math.floor(data.length / 4);
-              var used = frames * 4;
+              var frames = Math.floor(data.length / bpf);
+              var used = frames * bpf;
               leftover = used < data.length ? data.slice(used) : null;
               if (frames === 0) return;
               var now = ctx.currentTime;
               if (nextTime < now + 0.02) nextTime = now + delay;
               else if (nextTime > now + delay + 0.4) return;
-              var buf = ctx.createBuffer(2, frames, 48000);
-              var L = buf.getChannelData(0), R = buf.getChannelData(1);
+              var buf = ctx.createBuffer(ch, frames, cfg.rate);
+              var L = buf.getChannelData(0);
+              var R = ch === 2 ? buf.getChannelData(1) : null;
               var dv = new DataView(data.buffer, data.byteOffset, used);
               for (var i = 0; i < frames; i++) {
-                L[i] = dv.getInt16(i * 4, true) / 32768;
-                R[i] = dv.getInt16(i * 4 + 2, true) / 32768;
+                L[i] = dv.getInt16(i * bpf, true) / 32768;
+                if (R) R[i] = dv.getInt16(i * bpf + 2, true) / 32768;
               }
               var src = ctx.createBufferSource();
               src.buffer = buf;
@@ -246,13 +332,17 @@ jobs:
           import java.util.List;
           import java.util.concurrent.LinkedBlockingQueue;
           import java.util.concurrent.TimeUnit;
-          import java.util.concurrent.atomic.AtomicInteger;
 
           public class MirrorServer {
-              static final AtomicInteger VIEWERS = new AtomicInteger(0);
+              private static volatile long lastFrameReq = 0;
+
+              static boolean viewerActive() {
+                  return System.currentTimeMillis() - lastFrameReq < 3000;
+              }
 
               private final int port;
               private final byte[] html;
+              private volatile String config = "{\"audio\":false,\"rate\":48000,\"ch\":2}";
               private ServerSocket serverSocket;
               private volatile boolean running = false;
               private final Object lock = new Object();
@@ -264,6 +354,10 @@ jobs:
               public MirrorServer(int port, byte[] html) {
                   this.port = port;
                   this.html = html;
+              }
+
+              public void setConfig(String c) {
+                  config = c;
               }
 
               public void start() throws Exception {
@@ -311,31 +405,42 @@ jobs:
               private void handle(Socket s) {
                   try {
                       s.setTcpNoDelay(true);
-                      s.setSendBufferSize(128 * 1024);
-                      s.setSoTimeout(10000);
+                      s.setSoTimeout(30000);
                       BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream(), "ISO-8859-1"));
-                      String line = in.readLine();
-                      if (line == null) return;
-                      String h;
-                      while ((h = in.readLine()) != null && h.length() > 0) { }
-                      s.setSoTimeout(0);
-                      String[] parts = line.split(" ");
-                      String path = parts.length > 1 ? parts[1] : "/";
                       OutputStream out = s.getOutputStream();
-                      if (path.startsWith("/stream")) {
-                          stream(out);
-                      } else if (path.startsWith("/audio")) {
-                          audio(s, out);
-                      } else if (path.equals("/") || path.startsWith("/index")) {
-                          String head = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
-                                  + "Cache-Control: no-cache\r\n"
-                                  + "Content-Length: " + html.length + "\r\nConnection: close\r\n\r\n";
-                          out.write(head.getBytes("ISO-8859-1"));
-                          out.write(html);
-                          out.flush();
-                      } else {
-                          out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".getBytes("ISO-8859-1"));
-                          out.flush();
+                      while (running) {
+                          String line = in.readLine();
+                          if (line == null) return;
+                          String h;
+                          while ((h = in.readLine()) != null && h.length() > 0) { }
+                          String[] parts = line.split(" ");
+                          String path = parts.length > 1 ? parts[1] : "/";
+                          if (path.startsWith("/frame")) {
+                              serveFrame(out, path);
+                          } else if (path.startsWith("/audio")) {
+                              s.setSoTimeout(0);
+                              audio(s, out);
+                              return;
+                          } else if (path.startsWith("/config")) {
+                              byte[] b = config.getBytes("UTF-8");
+                              String head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n"
+                                      + "Content-Length: " + b.length + "\r\nConnection: keep-alive\r\n\r\n";
+                              out.write(head.getBytes("ISO-8859-1"));
+                              out.write(b);
+                              out.flush();
+                          } else if (path.equals("/") || path.startsWith("/?") || path.startsWith("/index")) {
+                              String head = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+                                      + "Cache-Control: no-cache\r\n"
+                                      + "Content-Length: " + html.length + "\r\nConnection: close\r\n\r\n";
+                              out.write(head.getBytes("ISO-8859-1"));
+                              out.write(html);
+                              out.flush();
+                              return;
+                          } else {
+                              out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".getBytes("ISO-8859-1"));
+                              out.flush();
+                              return;
+                          }
                       }
                   } catch (Exception e) {
                       // cliente desconectou
@@ -345,766 +450,38 @@ jobs:
                   }
               }
 
-              private void stream(OutputStream out) throws Exception {
-                  VIEWERS.incrementAndGet();
-                  try {
-                      String head = "HTTP/1.1 200 OK\r\n"
-                              + "Cache-Control: no-cache, no-store\r\n"
-                              + "Pragma: no-cache\r\n"
-                              + "Connection: close\r\n"
-                              + "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+              // A TV pede o quadro seguinte ao que ja tem; o servidor espera um quadro novo (ate 2 s).
+              private void serveFrame(OutputStream out, String path) throws Exception {
+                  lastFrameReq = System.currentTimeMillis();
+                  long after = -1;
+                  int q = path.indexOf("after=");
+                  if (q >= 0) {
+                      try { after = Long.parseLong(path.substring(q + 6).split("&")[0]); } catch (Exception e) { }
+                  }
+                  byte[] f;
+                  long s;
+                  synchronized (lock) {
+                      long deadline = System.currentTimeMillis() + 2000;
+                      while (running && (frame == null || seq <= after)) {
+                          long w = deadline - System.currentTimeMillis();
+                          if (w <= 0) break;
+                          lock.wait(w);
+                      }
+                      f = frame;
+                      s = seq;
+                  }
+                  lastFrameReq = System.currentTimeMillis();
+                  if (f == null || s <= after) {
+                      String head = "HTTP/1.1 204 No Content\r\nX-Seq: " + s + "\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n\r\n";
                       out.write(head.getBytes("ISO-8859-1"));
                       out.flush();
-                      long last = -1;
-                      while (running) {
-                          byte[] f;
-                          synchronized (lock) {
-                              while (running && seq == last) lock.wait(1000);
-                              f = frame;
-                              last = seq;
-                          }
-                          if (f == null) continue;
-                          String part = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + f.length + "\r\n\r\n";
-                          out.write(part.getBytes("ISO-8859-1"));
-                          out.write(f);
-                          out.write("\r\n".getBytes("ISO-8859-1"));
-                          out.flush();
-                      }
-                  } finally {
-                      VIEWERS.decrementAndGet();
-                  }
-              }
-
-              private void audio(Socket s, OutputStream out) throws Exception {
-                  try { s.setSendBufferSize(16 * 1024); } catch (Exception e) { }
-                  LinkedBlockingQueue<byte[]> q = new LinkedBlockingQueue<byte[]>(25);
-                  synchronized (audioQueues) { audioQueues.add(q); }
-                  try {
-                      String head = "HTTP/1.1 200 OK\r\n"
-                              + "Cache-Control: no-cache, no-store\r\n"
-                              + "Connection: close\r\n"
-                              + "Content-Type: application/octet-stream\r\n\r\n";
-                      out.write(head.getBytes("ISO-8859-1"));
-                      out.flush();
-                      while (running) {
-                          byte[] c = q.poll(1, TimeUnit.SECONDS);
-                          if (c == null) continue;
-                          out.write(c);
-                          out.flush();
-                      }
-                  } finally {
-                      synchronized (audioQueues) { audioQueues.remove(q); }
-                  }
-              }
-
-              public void stop() {
-                  running = false;
-                  try { if (serverSocket != null) serverSocket.close(); } catch (Exception e) { }
-                  synchronized (clients) {
-                      for (Socket s : clients) {
-                          try { s.close(); } catch (Exception e) { }
-                      }
-                      clients.clear();
-                  }
-                  synchronized (lock) { lock.notifyAll(); }
-                  VIEWERS.set(0);
-              }
-          }
-          EOF
-
-          cat > app/src/main/java/com/tvmirror/app/AudioCapture.java <<'EOF'
-          package com.tvmirror.app;
-
-          import android.annotation.TargetApi;
-          import android.media.AudioAttributes;
-          import android.media.AudioFormat;
-          import android.media.AudioPlaybackCaptureConfiguration;
-          import android.media.AudioRecord;
-          import android.media.projection.MediaProjection;
-
-          @TargetApi(29)
-          public class AudioCapture {
-              private static final int RATE = 48000;
-              private static final int CHUNK = 960 * 4; // 20 ms, estereo 16 bits
-              private final MirrorServer server;
-              private AudioRecord record;
-              private Thread thread;
-              private volatile boolean running = false;
-
-              public AudioCapture(MirrorServer server) {
-                  this.server = server;
-              }
-
-              public void start(MediaProjection projection) {
-                  AudioPlaybackCaptureConfiguration cfg = new AudioPlaybackCaptureConfiguration.Builder(projection)
-                          .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                          .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                          .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                          .build();
-                  AudioFormat fmt = new AudioFormat.Builder()
-                          .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                          .setSampleRate(RATE)
-                          .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
-                          .build();
-                  record = new AudioRecord.Builder()
-                          .setAudioFormat(fmt)
-                          .setBufferSizeInBytes(CHUNK * 8)
-                          .setAudioPlaybackCaptureConfig(cfg)
-                          .build();
-                  if (record.getState() != AudioRecord.STATE_INITIALIZED) {
-                      throw new IllegalStateException("AudioRecord nao iniciou");
-                  }
-                  record.startRecording();
-                  running = true;
-                  thread = new Thread(new Runnable() {
-                      @Override public void run() { loop(); }
-                  }, "audio-capture");
-                  thread.start();
-              }
-
-              private void loop() {
-                  byte[] buf = new byte[CHUNK];
-                  while (running) {
-                      int n;
-                      try {
-                          n = record.read(buf, 0, CHUNK);
-                      } catch (Exception e) {
-                          break;
-                      }
-                      if (n < 0) break;
-                      if (n == 0) continue;
-                      byte[] out = new byte[n];
-                      System.arraycopy(buf, 0, out, 0, n);
-                      server.pushAudio(out);
-                  }
-              }
-
-              public void stop() {
-                  running = false;
-                  try { if (record != null) record.stop(); } catch (Exception e) { }
-                  try { if (thread != null) thread.join(500); } catch (Exception e) { }
-                  try { if (record != null) record.release(); } catch (Exception e) { }
-                  record = null;
-              }
-          }
-          EOF
-
-          cat > app/src/main/java/com/tvmirror/app/MirrorService.java <<'EOF'
-          package com.tvmirror.app;
-
-          import android.app.Notification;
-          import android.app.NotificationChannel;
-          import android.app.NotificationManager;
-          import android.app.PendingIntent;
-          import android.app.Service;
-          import android.content.Intent;
-          import android.content.pm.PackageManager;
-          import android.content.pm.ServiceInfo;
-          import android.graphics.Bitmap;
-          import android.graphics.PixelFormat;
-          import android.hardware.display.DisplayManager;
-          import android.hardware.display.VirtualDisplay;
-          import android.media.Image;
-          import android.media.ImageReader;
-          import android.media.projection.MediaProjection;
-          import android.media.projection.MediaProjectionManager;
-          import android.os.Build;
-          import android.os.Handler;
-          import android.os.HandlerThread;
-          import android.os.IBinder;
-          import android.os.PowerManager;
-          import android.os.Process;
-          import android.os.SystemClock;
-          import android.util.DisplayMetrics;
-          import android.view.Display;
-          import java.io.ByteArrayOutputStream;
-          import java.io.InputStream;
-          import java.nio.ByteBuffer;
-
-          public class MirrorService extends Service {
-              static volatile boolean running = false;
-              static volatile boolean audioActive = false;
-              static final int PORT = 8080;
-              static final String ACTION_STOP = "com.tvmirror.app.STOP";
-
-              // presets: 0 = Fluido, 1 = Equilibrado, 2 = Nitido
-              private static final int[] MAX_EDGE = { 960, 1280, 1920 };
-              private static final int[] QUALITY = { 60, 70, 80 };
-              private static final int[] INTERVAL_MS = { 25, 33, 42 };
-              private static final String CHANNEL = "mirror";
-
-              private int maxEdge = 1280;
-              private int quality = 70;
-              private int minIntervalMs = 33;
-
-              private MediaProjection projection;
-              private MediaProjection.Callback projCallback;
-              private VirtualDisplay vd;
-              private ImageReader reader;
-              private HandlerThread thread;
-              private Handler handler;
-              private MirrorServer server;
-              private DisplayManager dm;
-              private DisplayManager.DisplayListener dispListener;
-              private AudioCapture audio;
-              private PowerManager.WakeLock wl;
-              private int capW, capH, dpi;
-              private Bitmap bmp;
-              private long lastFrameMs = 0;
-              private boolean framePending = false;
-              private final ByteArrayOutputStream baos = new ByteArrayOutputStream(256 * 1024);
-
-              private final Runnable pendingTask = new Runnable() {
-                  @Override public void run() {
-                      framePending = false;
-                      if (reader != null) processFrame(reader);
-                  }
-              };
-
-              @Override public IBinder onBind(Intent i) { return null; }
-
-              @Override public int onStartCommand(Intent intent, int flags, int startId) {
-                  if (intent != null && ACTION_STOP.equals(intent.getAction())) {
-                      stopSelf();
-                      return START_NOT_STICKY;
-                  }
-                  Notification n = buildNotification();
-                  if (Build.VERSION.SDK_INT >= 29) {
-                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
-                  } else {
-                      startForeground(1, n);
-                  }
-                  if (running) return START_NOT_STICKY;
-                  if (intent == null) { stopSelf(); return START_NOT_STICKY; }
-                  try {
-                      setup(intent);
-                      running = true;
-                  } catch (Exception e) {
-                      cleanup();
-                      stopSelf();
-                  }
-                  return START_NOT_STICKY;
-              }
-
-              private void setup(Intent intent) throws Exception {
-                  int code = intent.getIntExtra("code", 0);
-                  Intent data = (Intent) intent.getParcelableExtra("data");
-                  int p = intent.getIntExtra("preset", 1);
-                  if (p < 0 || p > 2) p = 1;
-                  maxEdge = MAX_EDGE[p];
-                  quality = QUALITY[p];
-                  minIntervalMs = INTERVAL_MS[p];
-
-                  MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
-
-                  thread = new HandlerThread("capture", Process.THREAD_PRIORITY_DISPLAY);
-                  thread.start();
-                  handler = new Handler(thread.getLooper());
-
-                  projection = mpm.getMediaProjection(code, data);
-                  projCallback = new MediaProjection.Callback() {
-                      @Override public void onStop() { stopSelf(); }
-                  };
-                  projection.registerCallback(projCallback, handler);
-
-                  server = new MirrorServer(PORT, readAsset("index.html"));
-                  server.start();
-
-                  dm = (DisplayManager) getSystemService(DISPLAY_SERVICE);
-                  int[] s = computeSize();
-                  capW = s[0]; capH = s[1]; dpi = s[2];
-
-                  reader = makeReader();
-                  vd = projection.createVirtualDisplay("tvmirror", capW, capH, dpi,
-                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.getSurface(), null, handler);
-
-                  dispListener = new DisplayManager.DisplayListener() {
-                      @Override public void onDisplayAdded(int id) { }
-                      @Override public void onDisplayRemoved(int id) { }
-                      @Override public void onDisplayChanged(int id) {
-                          if (id == Display.DEFAULT_DISPLAY) onScreenChanged();
-                      }
-                  };
-                  dm.registerDisplayListener(dispListener, handler);
-
-                  if (Build.VERSION.SDK_INT >= 29
-                          && checkSelfPermission("android.permission.RECORD_AUDIO") == PackageManager.PERMISSION_GRANTED) {
-                      try {
-                          audio = new AudioCapture(server);
-                          audio.start(projection);
-                          audioActive = true;
-                      } catch (Exception e) {
-                          audio = null;
-                          audioActive = false;
-                      }
-                  }
-
-                  PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
-                  wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "tvmirror:capture");
-                  wl.acquire();
-              }
-
-              private byte[] readAsset(String name) throws Exception {
-                  InputStream is = getAssets().open(name);
-                  ByteArrayOutputStream b = new ByteArrayOutputStream();
-                  byte[] buf = new byte[4096];
-                  int n;
-                  while ((n = is.read(buf)) > 0) b.write(buf, 0, n);
-                  is.close();
-                  return b.toByteArray();
-              }
-
-              private int[] computeSize() {
-                  DisplayMetrics m = new DisplayMetrics();
-                  dm.getDisplay(Display.DEFAULT_DISPLAY).getRealMetrics(m);
-                  int longEdge = Math.max(m.widthPixels, m.heightPixels);
-                  float scale = longEdge > maxEdge ? (float) maxEdge / longEdge : 1f;
-                  int w = Math.max(2, ((int) (m.widthPixels * scale)) & ~1);
-                  int h = Math.max(2, ((int) (m.heightPixels * scale)) & ~1);
-                  return new int[] { w, h, m.densityDpi };
-              }
-
-              private ImageReader makeReader() {
-                  ImageReader r = ImageReader.newInstance(capW, capH, PixelFormat.RGBA_8888, 2);
-                  r.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
-                      @Override public void onImageAvailable(ImageReader rd) { onFrameAvailable(rd); }
-                  }, handler);
-                  return r;
-              }
-
-              private void onScreenChanged() {
-                  try {
-                      if (vd == null) return;
-                      int[] s = computeSize();
-                      if (s[0] == capW && s[1] == capH) return;
-                      capW = s[0]; capH = s[1]; dpi = s[2];
-                      ImageReader old = reader;
-                      reader = makeReader();
-                      vd.setSurface(reader.getSurface());
-                      vd.resize(capW, capH, dpi);
-                      old.close();
-                      bmp = null;
-                  } catch (Exception e) {
-                      // ignora
-                  }
-              }
-
-              private void onFrameAvailable(ImageReader rd) {
-                  if (rd != reader) return;
-                  long wait = minIntervalMs - (SystemClock.uptimeMillis() - lastFrameMs);
-                  if (wait > 0) {
-                      if (!framePending) {
-                          framePending = true;
-                          handler.postDelayed(pendingTask, wait);
-                      }
                       return;
                   }
-                  processFrame(rd);
+                  String head = "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: " + f.length
+                          + "\r\nX-Seq: " + s + "\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n\r\n";
+                  out.write(head.getBytes("ISO-8859-1"));
+                  out.write(f);
+                  out.flush();
               }
 
-              private void processFrame(ImageReader rd) {
-                  lastFrameMs = SystemClock.uptimeMillis();
-                  Image img = null;
-                  try {
-                      img = rd.acquireLatestImage();
-                      if (img == null) return;
-                      Image.Plane p = img.getPlanes()[0];
-                      ByteBuffer buf = p.getBuffer();
-                      int pixelStride = p.getPixelStride();
-                      int rowStride = p.getRowStride();
-                      int fullW = rowStride / pixelStride;
-                      int w = img.getWidth();
-                      int h = img.getHeight();
-                      if (bmp == null || bmp.getWidth() != fullW || bmp.getHeight() != h) {
-                          bmp = Bitmap.createBitmap(fullW, h, Bitmap.Config.ARGB_8888);
-                      }
-                      bmp.copyPixelsFromBuffer(buf);
-                      Bitmap out = bmp;
-                      if (fullW != w) out = Bitmap.createBitmap(bmp, 0, 0, w, h);
-                      baos.reset();
-                      out.compress(Bitmap.CompressFormat.JPEG, quality, baos);
-                      if (out != bmp) out.recycle();
-                      if (server != null) server.push(baos.toByteArray());
-                  } catch (Exception e) {
-                      // ignora frame com erro
-                  } finally {
-                      if (img != null) img.close();
-                  }
-              }
-
-              private Notification buildNotification() {
-                  Intent open = new Intent(this, MainActivity.class);
-                  int piFlags = Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0;
-                  PendingIntent pi = PendingIntent.getActivity(this, 0, open, piFlags);
-                  Intent stop = new Intent(this, MirrorService.class);
-                  stop.setAction(ACTION_STOP);
-                  PendingIntent stopPi = PendingIntent.getService(this, 1, stop, piFlags);
-                  Notification.Builder b;
-                  if (Build.VERSION.SDK_INT >= 26) {
-                      NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-                      nm.createNotificationChannel(new NotificationChannel(CHANNEL, "Espelhamento", NotificationManager.IMPORTANCE_LOW));
-                      b = new Notification.Builder(this, CHANNEL);
-                  } else {
-                      b = new Notification.Builder(this);
-                  }
-                  return b.setContentTitle("Espelhando a tela")
-                          .setContentText("Abra o endereco no navegador da TV")
-                          .setSmallIcon(android.R.drawable.ic_menu_share)
-                          .setContentIntent(pi)
-                          .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Parar", stopPi)
-                          .setOngoing(true)
-                          .build();
-              }
-
-              private void cleanup() {
-                  running = false;
-                  audioActive = false;
-                  try { if (handler != null) handler.removeCallbacks(pendingTask); } catch (Exception e) { }
-                  try { if (audio != null) audio.stop(); } catch (Exception e) { }
-                  audio = null;
-                  try { if (dm != null && dispListener != null) dm.unregisterDisplayListener(dispListener); } catch (Exception e) { }
-                  try { if (vd != null) vd.release(); } catch (Exception e) { }
-                  try { if (reader != null) reader.close(); } catch (Exception e) { }
-                  try {
-                      if (projection != null) {
-                          if (projCallback != null) projection.unregisterCallback(projCallback);
-                          projection.stop();
-                      }
-                  } catch (Exception e) { }
-                  try { if (server != null) server.stop(); } catch (Exception e) { }
-                  try { if (wl != null && wl.isHeld()) wl.release(); } catch (Exception e) { }
-                  try { if (thread != null) thread.quitSafely(); } catch (Exception e) { }
-                  vd = null; reader = null; projection = null; server = null;
-                  wl = null; thread = null; dispListener = null; bmp = null;
-              }
-
-              @Override public void onDestroy() {
-                  cleanup();
-                  super.onDestroy();
-              }
-          }
-          EOF
-
-          cat > app/src/main/java/com/tvmirror/app/MainActivity.java <<'EOF'
-          package com.tvmirror.app;
-
-          import android.app.Activity;
-          import android.content.Context;
-          import android.content.Intent;
-          import android.content.SharedPreferences;
-          import android.content.pm.PackageManager;
-          import android.graphics.Typeface;
-          import android.graphics.drawable.GradientDrawable;
-          import android.media.projection.MediaProjectionManager;
-          import android.os.Build;
-          import android.os.Bundle;
-          import android.os.Handler;
-          import android.os.Looper;
-          import android.view.Gravity;
-          import android.view.View;
-          import android.view.ViewGroup;
-          import android.widget.LinearLayout;
-          import android.widget.ScrollView;
-          import android.widget.TextView;
-          import java.net.Inet4Address;
-          import java.net.InetAddress;
-          import java.net.NetworkInterface;
-          import java.util.ArrayList;
-          import java.util.Collections;
-          import java.util.List;
-
-          public class MainActivity extends Activity {
-              private static final int REQ_CAPTURE = 1001;
-
-              private static final int BG = 0xFF0E1014;
-              private static final int CARD = 0xFF1A1D24;
-              private static final int CHIP = 0xFF262B35;
-              private static final int ACCENT = 0xFF4C8DFF;
-              private static final int DANGER = 0xFFE5484D;
-              private static final int GREEN = 0xFF30A46C;
-              private static final int AMBER = 0xFFF5A524;
-              private static final int GRAY = 0xFF6B7280;
-              private static final int TEXT = 0xFFFFFFFF;
-              private static final int MUTED = 0xFF9AA3B2;
-              private static final int LINK = 0xFF7FB2FF;
-
-              private static final String[] PRESET_NAMES = { "Fluido", "Equilibrado", "Nítido" };
-              private static final String[] PRESET_DESC = {
-                      "Menos atraso, imagem mais simples",
-                      "Bom para a maioria dos casos",
-                      "Mais detalhes, pode atrasar um pouco mais" };
-
-              private static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
-              private static final int WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
-
-              private SharedPreferences prefs;
-              private int preset = 1;
-              private View dot;
-              private TextView statusText, urlText, hintText, presetDesc, mainBtn, audioText;
-              private final TextView[] chips = new TextView[3];
-              private final Handler ui = new Handler(Looper.getMainLooper());
-              private final Runnable ticker = new Runnable() {
-                  @Override public void run() {
-                      refresh();
-                      ui.postDelayed(this, 1000);
-                  }
-              };
-
-              private int dp(int v) {
-                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
-              }
-
-              private GradientDrawable rounded(int color, int radiusDp) {
-                  GradientDrawable g = new GradientDrawable();
-                  g.setColor(color);
-                  g.setCornerRadius(dp(radiusDp));
-                  return g;
-              }
-
-              private LinearLayout.LayoutParams lp(int w, int h, int topDp) {
-                  LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(w, h);
-                  p.topMargin = dp(topDp);
-                  return p;
-              }
-
-              private TextView text(String s, int sp, int color, boolean bold) {
-                  TextView t = new TextView(this);
-                  t.setText(s);
-                  t.setTextSize(sp);
-                  t.setTextColor(color);
-                  if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
-                  return t;
-              }
-
-              @Override protected void onCreate(Bundle savedInstanceState) {
-                  super.onCreate(savedInstanceState);
-                  getWindow().setStatusBarColor(BG);
-                  getWindow().setNavigationBarColor(BG);
-                  prefs = getSharedPreferences("tvmirror", MODE_PRIVATE);
-                  preset = prefs.getInt("preset", 1);
-
-                  ScrollView sv = new ScrollView(this);
-                  sv.setBackgroundColor(BG);
-                  sv.setFillViewport(true);
-
-                  LinearLayout root = new LinearLayout(this);
-                  root.setOrientation(LinearLayout.VERTICAL);
-                  root.setPadding(dp(22), dp(36), dp(22), dp(28));
-
-                  root.addView(text("TV Mirror", 30, TEXT, true));
-                  root.addView(text("Espelhe a tela do celular na TV pelo hotspot", 15, MUTED, false), lp(MATCH, WRAP, 4));
-
-                  LinearLayout card = new LinearLayout(this);
-                  card.setOrientation(LinearLayout.VERTICAL);
-                  card.setBackground(rounded(CARD, 16));
-                  card.setPadding(dp(18), dp(18), dp(18), dp(18));
-
-                  LinearLayout statusRow = new LinearLayout(this);
-                  statusRow.setOrientation(LinearLayout.HORIZONTAL);
-                  statusRow.setGravity(Gravity.CENTER_VERTICAL);
-                  dot = new View(this);
-                  statusRow.addView(dot, new LinearLayout.LayoutParams(dp(12), dp(12)));
-                  statusText = text("", 18, TEXT, true);
-                  LinearLayout.LayoutParams stp = new LinearLayout.LayoutParams(WRAP, WRAP);
-                  stp.leftMargin = dp(10);
-                  statusRow.addView(statusText, stp);
-                  card.addView(statusRow);
-
-                  urlText = text("", 20, LINK, true);
-                  urlText.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-                  urlText.setTextIsSelectable(true);
-                  card.addView(urlText, lp(MATCH, WRAP, 14));
-
-                  hintText = text("", 15, MUTED, false);
-                  card.addView(hintText, lp(MATCH, WRAP, 10));
-                  root.addView(card, lp(MATCH, WRAP, 22));
-
-                  root.addView(text("Qualidade", 14, MUTED, true), lp(MATCH, WRAP, 24));
-                  LinearLayout row = new LinearLayout(this);
-                  row.setOrientation(LinearLayout.HORIZONTAL);
-                  for (int i = 0; i < 3; i++) {
-                      final int idx = i;
-                      TextView c = text(PRESET_NAMES[i], 15, MUTED, true);
-                      c.setGravity(Gravity.CENTER);
-                      c.setPadding(dp(6), dp(13), dp(6), dp(13));
-                      c.setOnClickListener(new View.OnClickListener() {
-                          @Override public void onClick(View v) {
-                              if (MirrorService.running) return;
-                              preset = idx;
-                              prefs.edit().putInt("preset", idx).apply();
-                              refresh();
-                          }
-                      });
-                      LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(0, WRAP, 1f);
-                      if (i > 0) cp.leftMargin = dp(8);
-                      row.addView(c, cp);
-                      chips[i] = c;
-                  }
-                  root.addView(row, lp(MATCH, WRAP, 8));
-                  presetDesc = text("", 13, MUTED, false);
-                  root.addView(presetDesc, lp(MATCH, WRAP, 8));
-
-                  mainBtn = text("", 18, TEXT, true);
-                  mainBtn.setGravity(Gravity.CENTER);
-                  mainBtn.setPadding(dp(8), dp(18), dp(8), dp(18));
-                  mainBtn.setOnClickListener(new View.OnClickListener() {
-                      @Override public void onClick(View v) { toggle(); }
-                  });
-                  root.addView(mainBtn, lp(MATCH, WRAP, 26));
-
-                  audioText = text("", 13, MUTED, false);
-                  root.addView(audioText, lp(MATCH, WRAP, 18));
-
-                  sv.addView(root);
-                  setContentView(sv);
-
-                  List<String> perms = new ArrayList<String>();
-                  if (Build.VERSION.SDK_INT >= 33
-                          && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
-                      perms.add("android.permission.POST_NOTIFICATIONS");
-                  }
-                  if (Build.VERSION.SDK_INT >= 29
-                          && checkSelfPermission("android.permission.RECORD_AUDIO") != PackageManager.PERMISSION_GRANTED) {
-                      perms.add("android.permission.RECORD_AUDIO");
-                  }
-                  if (!perms.isEmpty()) requestPermissions(perms.toArray(new String[0]), 1);
-
-                  refresh();
-              }
-
-              @Override protected void onResume() {
-                  super.onResume();
-                  ui.post(ticker);
-              }
-
-              @Override protected void onPause() {
-                  super.onPause();
-                  ui.removeCallbacks(ticker);
-              }
-
-              private void toggle() {
-                  if (MirrorService.running) {
-                      stopService(new Intent(this, MirrorService.class));
-                      ui.postDelayed(new Runnable() {
-                          @Override public void run() { refresh(); }
-                      }, 500);
-                  } else {
-                      MediaProjectionManager m = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
-                      startActivityForResult(m.createScreenCaptureIntent(), REQ_CAPTURE);
-                  }
-              }
-
-              @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-                  super.onActivityResult(requestCode, resultCode, data);
-                  if (requestCode == REQ_CAPTURE && resultCode == RESULT_OK && data != null) {
-                      Intent i = new Intent(this, MirrorService.class);
-                      i.putExtra("code", resultCode);
-                      i.putExtra("data", data);
-                      i.putExtra("preset", preset);
-                      if (Build.VERSION.SDK_INT >= 26) startForegroundService(i);
-                      else startService(i);
-                      ui.postDelayed(new Runnable() {
-                          @Override public void run() { refresh(); }
-                      }, 800);
-                  }
-              }
-
-              private void refresh() {
-                  boolean on = MirrorService.running;
-                  int viewers = MirrorServer.VIEWERS.get();
-
-                  int color;
-                  String status;
-                  if (!on) { color = GRAY; status = "Parado"; }
-                  else if (viewers > 0) { color = GREEN; status = "TV conectada"; }
-                  else { color = AMBER; status = "Aguardando a TV…"; }
-                  dot.setBackground(rounded(color, 6));
-                  statusText.setText(status);
-
-                  if (on) {
-                      StringBuilder sb = new StringBuilder();
-                      for (String ip : localIps()) {
-                          if (sb.length() > 0) sb.append("\n");
-                          sb.append("http://").append(ip).append(":").append(MirrorService.PORT);
-                      }
-                      if (sb.length() == 0) sb.append("Ligue o hotspot");
-                      urlText.setVisibility(View.VISIBLE);
-                      urlText.setText(sb.toString());
-                      hintText.setText("Abra este endereço no navegador (Internet) da TV.");
-                  } else {
-                      urlText.setVisibility(View.GONE);
-                      hintText.setText("1. Ligue o hotspot do celular\n2. Conecte a TV nele\n3. Toque em Iniciar\n4. Abra o endereço mostrado no navegador da TV\n\nDica: hotspot em 5 GHz reduz o atraso.");
-                  }
-
-                  for (int i = 0; i < 3; i++) {
-                      boolean sel = (i == preset);
-                      chips[i].setBackground(rounded(sel ? ACCENT : CHIP, 12));
-                      chips[i].setTextColor(sel ? TEXT : MUTED);
-                      chips[i].setAlpha(on ? 0.5f : 1f);
-                  }
-                  presetDesc.setText(PRESET_DESC[preset]);
-
-                  mainBtn.setText(on ? "Parar espelhamento" : "Iniciar espelhamento");
-                  mainBtn.setBackground(rounded(on ? DANGER : ACCENT, 14));
-
-                  String a;
-                  if (Build.VERSION.SDK_INT < 29) {
-                      a = "Som: indisponível neste Android (precisa do 10 ou superior). O vídeo funciona normalmente.";
-                  } else if (on) {
-                      a = MirrorService.audioActive
-                              ? "Som: ativo. Na TV, aperte OK no controle para ligar. Setas esquerda/direita ajustam o atraso."
-                              : "Som: indisponível. Permita o microfone nas permissões do app e inicie de novo.";
-                  } else {
-                      a = "Som: disponível neste celular (Android 10+).";
-                  }
-                  audioText.setText(a);
-              }
-
-              private static List<String> localIps() {
-                  List<String> r = new ArrayList<String>();
-                  try {
-                      for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
-                          if (!ni.isUp() || ni.isLoopback()) continue;
-                          String n = ni.getName();
-                          if (n.startsWith("rmnet") || n.startsWith("ccmni") || n.startsWith("dummy")
-                                  || n.startsWith("tun") || n.startsWith("v4-")) continue;
-                          for (InetAddress a : Collections.list(ni.getInetAddresses())) {
-                              if (a instanceof Inet4Address && !a.isLoopbackAddress()) {
-                                  r.add(a.getHostAddress());
-                              }
-                          }
-                      }
-                  } catch (Exception e) { }
-                  return r;
-              }
-          }
-          EOF
-
-          find . -type f | sort
-
-      - name: Compilar APK
-        working-directory: tvmirror
-        run: gradle assembleDebug --no-daemon --stacktrace
-
-      - name: Renomear APK
-        run: cp tvmirror/app/build/outputs/apk/debug/app-debug.apk TVMirror.apk
-
-      - name: Guardar APK (artifact)
-        uses: actions/upload-artifact@v4
-        with:
-          name: TVMirror-apk
-          path: TVMirror.apk
-          if-no-files-found: error
-
-      - name: Publicar APK em Releases
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: apk-${{ github.run_number }}
-          name: TV Mirror APK #${{ github.run_number }}
-          files: TVMirror.apk
-          fail_on_unmatched_files: true
-
-      - name: Resumo com link do APK
-        run: |
-          echo "### APK pronto" >> "$GITHUB_STEP_SUMMARY"
-          echo "Baixe aqui: https://github.com/${{ github.repository }}/releases/tag/apk-${{ github.run_number }}" >> "$GITHUB_STEP_SUMMARY"
+       
